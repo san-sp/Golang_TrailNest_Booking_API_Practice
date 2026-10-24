@@ -271,11 +271,15 @@ func (r *Repository) ProcessSuccessfulWebhook(
 	}
 
 	_, err = tx.Exec(ctx, `
-		INSERT INTO bookings (
-			customer_id, activity_id, quantity, status
-		)
-		VALUES ($1, $2, $3, 'confirmed')
-	`, customerID, activityID, quantity)
+        INSERT INTO bookings (
+                customer_id,
+                activity_id,
+                reservation_id,
+                quantity,
+                status
+        )
+        VALUES ($1, $2, $3, $4, 'confirmed')
+`, customerID, activityID, reservationID, quantity)
 	if err != nil {
 		return fmt.Errorf("create confirmed booking: %w", err)
 	}

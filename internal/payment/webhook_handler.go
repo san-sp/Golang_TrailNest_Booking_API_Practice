@@ -33,13 +33,24 @@ type razorpayWebhookEvent struct {
 	Payload struct {
 		Payment struct {
 			Entity struct {
-				ID       string `json:"id"`
-				OrderID  string `json:"order_id"`
-				Amount   int64  `json:"amount"`
-				Currency string `json:"currency"`
-				Status   string `json:"status"`
+				ID            string `json:"id"`
+				OrderID       string `json:"order_id"`
+				PaymentLinkID string `json:"payment_link_id"`
+				Amount        int64  `json:"amount"`
+				Currency      string `json:"currency"`
+				Status        string `json:"status"`
 			} `json:"entity"`
 		} `json:"payment"`
+
+		PaymentLink struct {
+			Entity struct {
+				ID          string `json:"id"`
+				ReferenceID string `json:"reference_id"`
+				Amount      int64  `json:"amount"`
+				Currency    string `json:"currency"`
+				Status      string `json:"status"`
+			} `json:"entity"`
+		} `json:"payment_link"`
 	} `json:"payload"`
 }
 
@@ -78,6 +89,13 @@ func (h *WebhookHandler) Handle(c *gin.Context) {
 	// A valid event that this endpoint doesn't handle is acknowledged.
 	// Configure Razorpay to send payment.captured for successful fulfillment.
 	// Acknowledge valid event types that this handler doesn't process.
+	eventID := strings.TrimSpace(c.GetHeader("X-Razorpay-Event-Id"))
+
+	if event.Event == "payment_link.paid" {
+		h.handlePaymentLinkPaid(c, event, eventID)
+		return
+	}
+
 	if event.Event != "payment.captured" &&
 		event.Event != "payment.failed" {
 		c.Status(http.StatusOK)
@@ -85,7 +103,6 @@ func (h *WebhookHandler) Handle(c *gin.Context) {
 	}
 
 	entity := event.Payload.Payment.Entity
-	eventID := strings.TrimSpace(c.GetHeader("X-Razorpay-Event-Id"))
 
 	if eventID == "" || entity.ID == "" || entity.OrderID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "missing payment event details"})
@@ -198,6 +215,151 @@ func (h *WebhookHandler) Handle(c *gin.Context) {
 
 	if err := h.repository.ProcessSuccessfulWebhook(
 		c.Request.Context(),
+		"razorpay",
+		eventID,
+		event.Event,
+		providerPayment.ID,
+	); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "could not process payment event",
+		})
+		return
+	}
+
+	c.Status(http.StatusOK)
+}
+
+func (h *WebhookHandler) handlePaymentLinkPaid(
+	c *gin.Context,
+	event razorpayWebhookEvent,
+	eventID string,
+) {
+	linkEvent := event.Payload.PaymentLink.Entity
+	paymentEvent := event.Payload.Payment.Entity
+
+	if strings.TrimSpace(eventID) == "" ||
+		strings.TrimSpace(linkEvent.ID) == "" ||
+		strings.TrimSpace(linkEvent.ReferenceID) == "" ||
+		strings.TrimSpace(paymentEvent.ID) == "" ||
+		strings.TrimSpace(paymentEvent.PaymentLinkID) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "missing payment link event details",
+		})
+		return
+	}
+
+	if linkEvent.Status != "paid" ||
+		paymentEvent.Status != "captured" ||
+		paymentEvent.PaymentLinkID != linkEvent.ID {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error": "payment link event is not a valid captured payment",
+		})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	localPayment, err := h.repository.GetByProviderPaymentLinkID(
+		ctx,
+		"razorpay",
+		linkEvent.ID,
+	)
+	if err != nil {
+		if errors.Is(err, ErrPaymentNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{
+				"error": "payment link not found",
+			})
+			return
+		}
+
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "could not load payment link",
+		})
+		return
+	}
+
+	if linkEvent.ReferenceID != localPayment.ID.String() ||
+		localPayment.ProviderPaymentLinkID != linkEvent.ID ||
+		linkEvent.Amount != localPayment.AmountMinor ||
+		paymentEvent.Amount != localPayment.AmountMinor ||
+		!strings.EqualFold(linkEvent.Currency, localPayment.Currency) ||
+		!strings.EqualFold(paymentEvent.Currency, localPayment.Currency) {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error": "payment link details do not match local payment",
+		})
+		return
+	}
+
+	providerLink, err := h.razorpay.FetchPaymentLink(ctx, linkEvent.ID)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error": "could not verify provider payment link",
+		})
+		return
+	}
+
+	if providerLink.ID != localPayment.ProviderPaymentLinkID ||
+		providerLink.ReferenceID != localPayment.ID.String() ||
+		providerLink.Amount != localPayment.AmountMinor ||
+		providerLink.AmountPaid != localPayment.AmountMinor ||
+		!strings.EqualFold(providerLink.Currency, localPayment.Currency) ||
+		providerLink.Status != "paid" {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error": "provider payment link does not match local payment",
+		})
+		return
+	}
+
+	providerPayment, err := h.razorpay.FetchPayment(ctx, paymentEvent.ID)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error": "could not verify provider payment",
+		})
+		return
+	}
+
+	if providerPayment.ID != paymentEvent.ID ||
+		providerPayment.PaymentLinkID != linkEvent.ID ||
+		providerPayment.Amount != localPayment.AmountMinor ||
+		!strings.EqualFold(providerPayment.Currency, localPayment.Currency) ||
+		providerPayment.Status != "captured" {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error": "provider payment does not match local payment",
+		})
+		return
+	}
+
+	if err := h.repository.RecordPaymentLinkAttempt(
+		ctx,
+		localPayment.ID,
+		linkEvent.ID,
+		providerPayment.ID,
+		localPayment.AmountMinor,
+		localPayment.Currency,
+		"captured",
+	); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "could not record captured payment attempt",
+		})
+		return
+	}
+
+	if err := h.repository.AssociateProviderPaymentLink(
+		ctx,
+		localPayment.ID,
+		linkEvent.ID,
+		providerPayment.ID,
+		localPayment.AmountMinor,
+		localPayment.Currency,
+	); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "could not associate provider payment",
+		})
+		return
+	}
+
+	if err := h.repository.ProcessSuccessfulWebhook(
+		ctx,
 		"razorpay",
 		eventID,
 		event.Event,

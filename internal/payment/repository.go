@@ -21,18 +21,20 @@ var (
 )
 
 type Payment struct {
-	ID                uuid.UUID `json:"id"`
-	ReservationID     uuid.UUID `json:"reservation_id"`
-	CustomerID        uuid.UUID `json:"customer_id"`
-	AmountMinor       int64     `json:"amount_minor"`
-	Currency          string    `json:"currency"`
-	Status            string    `json:"status"`
-	Provider          string    `json:"provider"`
-	ProviderPaymentID string    `json:"provider_payment_id,omitempty"`
-	IdempotencyKey    string    `json:"idempotency_key"`
-	CreatedAt         time.Time `json:"created_at"`
-	ProviderOrderID   string    `json:"provider_order_id,omitempty"`
-	FulfillmentStatus string    `json:"fulfillment_status"`
+	ID                     uuid.UUID `json:"id"`
+	ReservationID          uuid.UUID `json:"reservation_id"`
+	CustomerID             uuid.UUID `json:"customer_id"`
+	AmountMinor            int64     `json:"amount_minor"`
+	Currency               string    `json:"currency"`
+	Status                 string    `json:"status"`
+	Provider               string    `json:"provider"`
+	ProviderPaymentID      string    `json:"provider_payment_id,omitempty"`
+	IdempotencyKey         string    `json:"idempotency_key"`
+	CreatedAt              time.Time `json:"created_at"`
+	ProviderOrderID        string    `json:"provider_order_id,omitempty"`
+	ProviderPaymentLinkID  string    `json:"provider_payment_link_id,omitempty"`
+	ProviderPaymentLinkURL string    `json:"provider_payment_link_url,omitempty"`
+	FulfillmentStatus      string    `json:"fulfillment_status"`
 }
 
 type Repository struct {
@@ -41,6 +43,72 @@ type Repository struct {
 
 func NewRepository(pool *pgxpool.Pool) *Repository {
 	return &Repository{pool: pool}
+}
+
+func (r *Repository) withPaymentLinkLock(
+	ctx context.Context,
+	paymentID uuid.UUID,
+	fn func() error,
+) error {
+	conn, err := r.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire payment link lock connection: %w", err)
+	}
+
+	releaseConn := true
+	defer func() {
+		if releaseConn {
+			conn.Release()
+		}
+	}()
+
+	var lockKey int64
+	err = conn.QueryRow(ctx,
+		`SELECT hashtextextended($1, 0)`,
+		paymentID.String(),
+	).Scan(&lockKey)
+	if err != nil {
+		return fmt.Errorf("build payment link lock key: %w", err)
+	}
+
+	_, err = conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, lockKey)
+	if err != nil {
+		return fmt.Errorf("acquire payment link advisory lock: %w", err)
+	}
+
+	operationErr := fn()
+
+	unlockCtx, cancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer cancel()
+
+	var unlocked bool
+	err = conn.QueryRow(
+		unlockCtx,
+		`SELECT pg_advisory_unlock($1)`,
+		lockKey,
+	).Scan(&unlocked)
+
+	if err != nil || !unlocked {
+		// Do not return a possibly locked session to the pool.
+		releaseConn = false
+		conn.Hijack()
+
+		if err != nil {
+			return errors.Join(
+				operationErr,
+				fmt.Errorf("release payment link advisory lock: %w", err),
+			)
+		}
+		return errors.Join(
+			operationErr,
+			errors.New("release payment link advisory lock: lock was not held"),
+		)
+	}
+
+	return operationErr
 }
 
 func scanPayment(row pgx.Row) (Payment, error) {
@@ -56,6 +124,8 @@ func scanPayment(row pgx.Row) (Payment, error) {
 		&payment.Provider,
 		&payment.ProviderPaymentID,
 		&payment.ProviderOrderID,
+		&payment.ProviderPaymentLinkID,
+		&payment.ProviderPaymentLinkURL,
 		&payment.IdempotencyKey,
 		&payment.CreatedAt,
 		&payment.FulfillmentStatus,
@@ -67,7 +137,8 @@ func scanPayment(row pgx.Row) (Payment, error) {
 const paymentColumns = `
     id, reservation_id, customer_id, amount_minor, currency,
     status, provider, COALESCE(provider_payment_id, ''),
-    COALESCE(provider_order_id, ''),
+    COALESCE(provider_order_id, ''), COALESCE(provider_payment_link_id, ''),
+		COALESCE(provider_payment_link_url, ''),
     idempotency_key, created_at, fulfillment_status
 `
 
@@ -297,6 +368,49 @@ func (r *Repository) SaveProviderOrderID(
 	return payment, nil
 }
 
+func (r *Repository) SaveProviderPaymentLink(
+	ctx context.Context,
+	paymentID uuid.UUID,
+	linkID string,
+	linkURL string,
+) (Payment, error) {
+	linkID = strings.TrimSpace(linkID)
+	linkURL = strings.TrimSpace(linkURL)
+
+	if linkID == "" || linkURL == "" {
+		return Payment{}, errors.New("provider payment link ID and URL are required")
+	}
+
+	// Persist both values together. A retry may reuse the same link,
+	// but must not replace it with a different provider link.
+	payment, err := scanPayment(r.pool.QueryRow(ctx, `
+		UPDATE payments
+		SET provider_payment_link_id = $2,
+		    provider_payment_link_url = $3,
+		    updated_at = NOW()
+		WHERE id = $1
+		  AND provider = 'razorpay'
+		  AND (provider_payment_link_id IS NULL
+		       OR provider_payment_link_id = $2)
+		  AND (provider_payment_link_url IS NULL
+		       OR provider_payment_link_url = $3)
+		RETURNING `+paymentColumns,
+		paymentID,
+		linkID,
+		linkURL,
+	))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Payment{}, errors.New(
+			"payment already has a different provider payment link or does not exist",
+		)
+	}
+	if err != nil {
+		return Payment{}, fmt.Errorf("save provider payment link: %w", err)
+	}
+
+	return payment, nil
+}
+
 func (r *Repository) GetByIDForCustomer(
 	ctx context.Context,
 	paymentID uuid.UUID,
@@ -394,6 +508,90 @@ func (r *Repository) AssociateProviderPayment(
 	return nil
 }
 
+func (r *Repository) AssociateProviderPaymentLink(
+	ctx context.Context,
+	paymentID uuid.UUID,
+	linkID string,
+	providerPaymentID string,
+	amountMinor int64,
+	currency string,
+) error {
+	linkID = strings.TrimSpace(linkID)
+	providerPaymentID = strings.TrimSpace(providerPaymentID)
+	currency = strings.ToUpper(strings.TrimSpace(currency))
+
+	if linkID == "" || providerPaymentID == "" || currency == "" {
+		return errors.New("provider payment link details are required")
+	}
+
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin payment link association: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	var savedLinkID string
+	var savedProviderPaymentID string
+	var savedAmount int64
+	var savedCurrency string
+	var savedProvider string
+
+	err = tx.QueryRow(ctx, `
+        SELECT
+            COALESCE(provider_payment_link_id, ''),
+            COALESCE(provider_payment_id, ''),
+            amount_minor,
+            currency,
+            provider
+        FROM payments
+        WHERE id = $1
+        FOR UPDATE
+    `, paymentID).Scan(
+		&savedLinkID,
+		&savedProviderPaymentID,
+		&savedAmount,
+		&savedCurrency,
+		&savedProvider,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrPaymentNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("load payment link association: %w", err)
+	}
+
+	if savedProvider != "razorpay" ||
+		savedLinkID != linkID ||
+		savedAmount != amountMinor ||
+		!strings.EqualFold(strings.TrimSpace(savedCurrency), currency) {
+		return errors.New("provider payment does not match local payment link")
+	}
+
+	if savedProviderPaymentID != "" &&
+		savedProviderPaymentID != providerPaymentID {
+		return ErrIdempotencyConflict
+	}
+
+	_, err = tx.Exec(ctx, `
+        UPDATE payments
+        SET provider_payment_id = $2,
+            updated_at = NOW()
+        WHERE id = $1
+          AND (provider_payment_id IS NULL OR provider_payment_id = $2)
+    `, paymentID, providerPaymentID)
+	if err != nil {
+		return fmt.Errorf("associate provider payment link: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit payment link association: %w", err)
+	}
+
+	return nil
+}
+
 func (r *Repository) GetByProviderOrderID(
 	ctx context.Context,
 	provider string,
@@ -410,6 +608,37 @@ func (r *Repository) GetByProviderOrderID(
 	}
 	if err != nil {
 		return Payment{}, fmt.Errorf("find payment by provider order ID: %w", err)
+	}
+
+	return payment, nil
+}
+
+func (r *Repository) GetByProviderPaymentLinkID(
+	ctx context.Context,
+	provider string,
+	linkID string,
+) (Payment, error) {
+	provider = strings.TrimSpace(provider)
+	linkID = strings.TrimSpace(linkID)
+
+	if provider == "" || linkID == "" {
+		return Payment{}, ErrPaymentNotFound
+	}
+
+	payment, err := scanPayment(r.pool.QueryRow(ctx, `
+        SELECT `+paymentColumns+`
+        FROM payments
+        WHERE provider = $1
+          AND provider_payment_link_id = $2
+    `, provider, linkID))
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Payment{}, ErrPaymentNotFound
+	}
+	if err != nil {
+		return Payment{}, fmt.Errorf(
+			"find payment by provider payment link ID: %w", err,
+		)
 	}
 
 	return payment, nil
@@ -513,6 +742,110 @@ func (r *Repository) RecordPaymentAttempt(
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit payment attempt: %w", err)
+	}
+
+	return nil
+}
+
+func (r *Repository) RecordPaymentLinkAttempt(
+	ctx context.Context,
+	paymentID uuid.UUID,
+	linkID string,
+	providerPaymentID string,
+	amountMinor int64,
+	currency string,
+	status string,
+) error {
+	linkID = strings.TrimSpace(linkID)
+	providerPaymentID = strings.TrimSpace(providerPaymentID)
+	currency = strings.ToUpper(strings.TrimSpace(currency))
+	status = strings.TrimSpace(status)
+
+	if linkID == "" ||
+		providerPaymentID == "" ||
+		amountMinor <= 0 ||
+		len(currency) != 3 ||
+		status != "captured" {
+		return errors.New("invalid payment link attempt")
+	}
+
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin payment link attempt transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	var savedLinkID string
+	var savedProviderPaymentID string
+	var savedProvider string
+	var savedAmount int64
+	var savedCurrency string
+
+	err = tx.QueryRow(ctx, `
+		SELECT
+			COALESCE(provider_payment_link_id, ''),
+			COALESCE(provider_payment_id, ''),
+			provider,
+			amount_minor,
+			currency
+		FROM payments
+		WHERE id = $1
+		FOR UPDATE
+	`, paymentID).Scan(
+		&savedLinkID,
+		&savedProviderPaymentID,
+		&savedProvider,
+		&savedAmount,
+		&savedCurrency,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrPaymentNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("load payment link attempt: %w", err)
+	}
+
+	if savedProvider != "razorpay" ||
+		savedLinkID != linkID ||
+		savedAmount != amountMinor ||
+		!strings.EqualFold(strings.TrimSpace(savedCurrency), currency) {
+		return errors.New("payment attempt does not match local payment link")
+	}
+
+	if savedProviderPaymentID != "" &&
+		savedProviderPaymentID != providerPaymentID {
+		return ErrIdempotencyConflict
+	}
+
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO payment_attempts (
+			payment_id,
+			provider,
+			provider_payment_id,
+			amount_minor,
+			currency,
+			status
+		)
+		VALUES ($1, 'razorpay', $2, $3, $4, 'captured')
+		ON CONFLICT (provider, provider_payment_id)
+		DO UPDATE SET
+			status = 'captured',
+			updated_at = NOW()
+		WHERE payment_attempts.payment_id = EXCLUDED.payment_id
+			AND payment_attempts.amount_minor = EXCLUDED.amount_minor
+			AND payment_attempts.currency = EXCLUDED.currency
+	`, paymentID, providerPaymentID, amountMinor, currency)
+	if err != nil {
+		return fmt.Errorf("record payment link attempt: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("payment attempt conflicts with an existing attempt")
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit payment link attempt: %w", err)
 	}
 
 	return nil

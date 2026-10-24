@@ -3,6 +3,7 @@ package payment
 import (
 	"context"
 	"errors"
+	"net/url"
 	"strings"
 
 	"github.com/google/uuid"
@@ -24,6 +25,12 @@ type CheckoutResult struct {
 	Payment         Payment `json:"payment"`
 	RazorpayKeyID   string  `json:"razorpay_key_id"`
 	RazorpayOrderID string  `json:"razorpay_order_id"`
+}
+
+type HostedPaymentResult struct {
+	Payment        Payment `json:"payment"`
+	PaymentLinkID  string  `json:"payment_link_id"`
+	PaymentLinkURL string  `json:"payment_link_url"`
 }
 
 func NewCheckoutService(
@@ -56,6 +63,13 @@ func (s *CheckoutService) CreatePayment(
 	)
 	if err != nil {
 		return CheckoutResult{}, err
+	}
+
+	// Do not reuse a hosted Payment Link payment in Order-based checkout.
+	if payment.ProviderPaymentLinkID != "" {
+		return CheckoutResult{}, errors.New(
+			"payment already has a Razorpay Payment Link; use hosted checkout",
+		)
 	}
 
 	// Reuse the existing order when this is a checkout retry.
@@ -91,6 +105,129 @@ func (s *CheckoutService) CreatePayment(
 		RazorpayKeyID:   s.razorpay.KeyID(),
 		RazorpayOrderID: payment.ProviderOrderID,
 	}, nil
+}
+
+func (s *CheckoutService) CreateHostedPayment(
+	ctx context.Context,
+	customerID uuid.UUID,
+	reservationID uuid.UUID,
+	idempotencyKey string,
+) (HostedPaymentResult, error) {
+	if s.razorpay == nil {
+		return HostedPaymentResult{}, ErrRazorpayNotConfigured
+	}
+
+	payment, err := s.repository.CreatePending(
+		ctx,
+		customerID,
+		reservationID,
+		"razorpay",
+		idempotencyKey,
+	)
+	if err != nil {
+		return HostedPaymentResult{}, err
+	}
+
+	var result HostedPaymentResult
+
+	err = s.repository.withPaymentLinkLock(ctx, payment.ID, func() error {
+		// Reload after acquiring the lock. Another request may have
+		// created and saved the link while this request was waiting.
+		payment, err = s.repository.GetByIDForCustomer(
+			ctx,
+			payment.ID,
+			customerID,
+		)
+		if err != nil {
+			return err
+		}
+
+		// Reuse an existing hosted link on an idempotent retry.
+		if payment.ProviderPaymentLinkID != "" &&
+			payment.ProviderPaymentLinkURL != "" {
+			result = HostedPaymentResult{
+				Payment:        payment,
+				PaymentLinkID:  payment.ProviderPaymentLinkID,
+				PaymentLinkURL: payment.ProviderPaymentLinkURL,
+			}
+			return nil
+		}
+
+		// Do not silently switch an existing Order-based payment
+		// to hosted checkout.
+		if payment.ProviderOrderID != "" {
+			return errors.New(
+				"payment already has a Razorpay order; use the existing checkout flow",
+			)
+		}
+
+		// Recover a link created by an earlier request that timed out
+		// or failed to save it locally.
+		link, err := s.razorpay.FindPaymentLinkByReferenceID(
+			ctx,
+			payment.ID.String(),
+		)
+		if err != nil {
+			if !errors.Is(err, ErrRazorpayPaymentLinkNotFound) {
+				return err
+			}
+
+			// Create only after the lookup confirms no matching link.
+			link, err = s.razorpay.CreatePaymentLink(
+				ctx,
+				payment.AmountMinor,
+				payment.Currency,
+				payment.ID.String(),
+				"TrailNest booking payment "+payment.ID.String(),
+			)
+			if err != nil {
+				return err
+			}
+		}
+
+		parsedURL, urlErr := url.Parse(link.ShortURL)
+		if urlErr != nil ||
+			parsedURL.Scheme != "https" ||
+			!strings.EqualFold(parsedURL.Hostname(), "rzp.io") ||
+			parsedURL.User != nil {
+			return errors.New(
+				"Razorpay payment link does not match the local payment",
+			)
+		}
+
+		// Validate the provider response before saving it.
+		if link.ReferenceID != payment.ID.String() ||
+			link.Amount != payment.AmountMinor ||
+			!strings.EqualFold(link.Currency, payment.Currency) ||
+			!strings.HasPrefix(link.ID, "plink_") ||
+			link.ShortURL == "" {
+			return errors.New(
+				"Razorpay payment link does not match the local payment",
+			)
+		}
+
+		payment, err = s.repository.SaveProviderPaymentLink(
+			ctx,
+			payment.ID,
+			link.ID,
+			link.ShortURL,
+		)
+		if err != nil {
+			return err
+		}
+
+		result = HostedPaymentResult{
+			Payment:        payment,
+			PaymentLinkID:  payment.ProviderPaymentLinkID,
+			PaymentLinkURL: payment.ProviderPaymentLinkURL,
+		}
+		return nil
+	})
+	if err != nil {
+		return HostedPaymentResult{}, err
+	}
+
+	return result, nil
 }
 
 func (s *CheckoutService) VerifyCheckoutPayment(
