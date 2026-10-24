@@ -1,0 +1,40 @@
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: trailnest-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - '127.0.0.1:5436:5432'
+    volumes:
+      - trailnest_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: trailnest-api
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    volumes:
+      - ./.env.docker:/app/.env:ro
+    environment:
+      PORT: '8080'
+      DATABASE_URL: ${DATABASE_URL}
+    ports:
+      - '127.0.0.1:8081:8080'
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  trailnest_postgres_data:

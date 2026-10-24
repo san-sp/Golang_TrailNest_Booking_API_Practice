@@ -1,0 +1,18 @@
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Go build artifacts
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+
+.md.env.docker
