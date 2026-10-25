@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -210,4 +211,140 @@ func (r *Repository) GetAdminByID(
 	}
 
 	return item, nil
+}
+
+// ExpireOverdue expires a bounded batch of overdue pending reservations.
+// Activities are locked before reservations to match payment processing.
+func (r *Repository) ExpireOverdue(
+	ctx context.Context,
+	batchSize int,
+) (int64, error) {
+	if batchSize < 1 {
+		return 0, fmt.Errorf(
+			"reservation expiry batch size must be positive",
+		)
+	}
+
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return 0, fmt.Errorf(
+			"begin reservation expiry transaction: %w", err,
+		)
+	}
+	defer func() {
+		_ = tx.Rollback(context.Background())
+	}()
+
+	// Read candidate IDs without locking reservation rows.
+	rows, err := tx.Query(ctx, `
+        SELECT id, activity_id
+        FROM reservations
+        WHERE status = 'pending'
+          AND expires_at <= NOW()
+        ORDER BY expires_at, id
+        LIMIT $1
+    `, batchSize)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"find overdue reservations: %w", err,
+		)
+	}
+
+	type candidate struct {
+		reservationID uuid.UUID
+		activityID    uuid.UUID
+	}
+
+	candidates := make([]candidate, 0, batchSize)
+	activitySet := make(map[uuid.UUID]struct{})
+
+	for rows.Next() {
+		var item candidate
+		if err := rows.Scan(
+			&item.reservationID,
+			&item.activityID,
+		); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf(
+				"scan overdue reservation: %w", err,
+			)
+		}
+
+		candidates = append(candidates, item)
+		activitySet[item.activityID] = struct{}{}
+	}
+
+	rowsErr := rows.Err()
+	rows.Close()
+	if rowsErr != nil {
+		return 0, fmt.Errorf(
+			"iterate overdue reservations: %w", rowsErr,
+		)
+	}
+
+	if len(candidates) == 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return 0, fmt.Errorf(
+				"commit empty expiry transaction: %w", err,
+			)
+		}
+		return 0, nil
+	}
+
+	// Lock activities in a consistent order to reduce deadlock risk.
+	activityIDs := make([]uuid.UUID, 0, len(activitySet))
+	for id := range activitySet {
+		activityIDs = append(activityIDs, id)
+	}
+	sort.Slice(activityIDs, func(i, j int) bool {
+		return activityIDs[i].String() < activityIDs[j].String()
+	})
+
+	for _, activityID := range activityIDs {
+		var lockedID uuid.UUID
+		err := tx.QueryRow(ctx, `
+            SELECT id
+            FROM activities
+            WHERE id = $1
+            FOR UPDATE
+        `, activityID).Scan(&lockedID)
+
+		if err != nil {
+			return 0, fmt.Errorf(
+				"lock activity %s for reservation expiry: %w",
+				activityID, err,
+			)
+		}
+	}
+
+	reservationIDs := make([]uuid.UUID, 0, len(candidates))
+	for _, item := range candidates {
+		reservationIDs = append(
+			reservationIDs, item.reservationID,
+		)
+	}
+
+	// Recheck eligibility because payment processing may have changed
+	// a reservation while this transaction was waiting for activity locks.
+	tag, err := tx.Exec(ctx, `
+        UPDATE reservations
+        SET status = 'expired',
+            updated_at = NOW()
+        WHERE id = ANY($1::uuid[])
+          AND status = 'pending'
+          AND expires_at <= NOW()
+    `, reservationIDs)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"expire overdue reservations: %w", err,
+		)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf(
+			"commit reservation expiry transaction: %w", err,
+		)
+	}
+
+	return tag.RowsAffected(), nil
 }

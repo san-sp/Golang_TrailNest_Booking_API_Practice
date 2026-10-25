@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 	"trailnest/internal/activity"
@@ -254,6 +255,22 @@ func main() {
 	)
 	defer stop()
 
+	// Run reservation expiry independently of incoming HTTP requests.
+	// Wait for the worker to exit during graceful shutdown.
+	var workerWG sync.WaitGroup
+
+	workerWG.Add(1)
+	go func() {
+		defer workerWG.Done()
+
+		reservation.RunExpiryWorker(
+			shutdownCtx,
+			reservationRepository,
+			time.Minute,
+			100,
+		)
+	}()
+
 	serverErrors := make(chan error, 1)
 
 	go func() {
@@ -286,5 +303,8 @@ func main() {
 		}
 		return
 	}
+
+	workerWG.Wait()
+
 	slog.Info("TrailNest API stopped")
 }
