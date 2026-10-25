@@ -123,7 +123,6 @@ func createExpiryFixture(
 			t.Errorf("cleanup customer: %v", err)
 		}
 	})
-
 	return f
 }
 
@@ -210,7 +209,6 @@ func TestExpireOverdueRespectsBatchLimit(t *testing.T) {
 	}).Scan(&expiredCount)
 	require.NoError(t, err)
 	require.Equal(t, 2, expiredCount)
-
 }
 
 func TestExpireOverdueRejectsInvalidBatchSize(t *testing.T) {
