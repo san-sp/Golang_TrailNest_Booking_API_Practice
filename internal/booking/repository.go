@@ -12,11 +12,14 @@ import (
 )
 
 var (
-	ErrActivityNotFound        = errors.New("activity not found")
-	ErrActivityNotBookable     = errors.New("activity is not available for booking")
-	ErrInsufficientCapacity    = errors.New("not enough capacity available")
-	ErrBookingNotFound         = errors.New("booking not found")
-	ErrBookingAlreadyCancelled = errors.New("booking already cancelled")
+	ErrActivityNotFound           = errors.New("activity not found")
+	ErrActivityNotBookable        = errors.New("activity is not available for booking")
+	ErrInsufficientCapacity       = errors.New("not enough capacity available")
+	ErrBookingNotFound            = errors.New("booking not found")
+	ErrBookingAlreadyCancelled    = errors.New("booking already cancelled")
+	ErrCancellationDeadlinePassed = errors.New(
+		"booking cancellation deadline has passed",
+	)
 )
 
 type Booking struct {
@@ -62,21 +65,21 @@ func (r *Repository) Create(
 	var startsAt time.Time
 
 	err = tx.QueryRow(ctx, `
-		SELECT capacity, status, starts_at
-		FROM activities
-		WHERE id = $1
-		FOR UPDATE
-	`, activityID).Scan(&capacity, &status, &startsAt)
-
-	if !time.Now().Before(startsAt) {
-		return Booking{}, ErrActivityNotBookable
-	}
+    SELECT capacity, status, starts_at
+    FROM activities
+    WHERE id = $1
+    FOR UPDATE
+`, activityID).Scan(&capacity, &status, &startsAt)
 
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Booking{}, ErrActivityNotFound
 	}
 	if err != nil {
 		return Booking{}, fmt.Errorf("load activity: %w", err)
+	}
+
+	if !time.Now().Before(startsAt) {
+		return Booking{}, ErrActivityNotBookable
 	}
 
 	if status != "published" {
@@ -155,13 +158,14 @@ func (r *Repository) Cancel(
 	}
 
 	// Use the same lock order as booking creation.
-	var lockedActivityID uuid.UUID
+	var startsAt time.Time
+
 	err = tx.QueryRow(ctx, `
-		SELECT id
-		FROM activities
-		WHERE id = $1
-		FOR UPDATE
-	`, activityID).Scan(&lockedActivityID)
+    SELECT starts_at
+    FROM activities
+    WHERE id = $1
+    FOR UPDATE
+`, activityID).Scan(&startsAt)
 
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrActivityNotFound
@@ -187,6 +191,10 @@ func (r *Repository) Cancel(
 
 	if status == "cancelled" {
 		return ErrBookingAlreadyCancelled
+	}
+
+	if !time.Now().Before(startsAt.Add(-24 * time.Hour)) {
+		return ErrCancellationDeadlinePassed
 	}
 
 	_, err = tx.Exec(ctx, `

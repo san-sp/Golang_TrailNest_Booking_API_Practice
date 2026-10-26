@@ -317,3 +317,107 @@ func (s *CheckoutService) VerifyCheckoutPayment(
 		customerID,
 	)
 }
+
+func (s *CheckoutService) ReconcileCapturedPayment(
+	ctx context.Context,
+	localPaymentID uuid.UUID,
+	providerPaymentID string,
+) (Payment, error) {
+	if s.razorpay == nil {
+		return Payment{}, ErrRazorpayNotConfigured
+	}
+
+	providerPaymentID = strings.TrimSpace(providerPaymentID)
+	if providerPaymentID == "" {
+		return Payment{}, errors.New("provider payment ID is required")
+	}
+
+	localPayment, err := s.repository.GetAdminByID(ctx, localPaymentID)
+	if err != nil {
+		return Payment{}, err
+	}
+
+	if localPayment.Provider != "razorpay" ||
+		localPayment.ProviderOrderID == "" ||
+		localPayment.AmountMinor <= 0 {
+		return Payment{}, errors.New(
+			"local payment is not eligible for Razorpay reconciliation",
+		)
+	}
+
+	// Verify the payment directly with Razorpay before changing local state.
+	providerPayment, err := s.razorpay.FetchPayment(ctx, providerPaymentID)
+	if err != nil {
+		return Payment{}, err
+	}
+
+	if providerPayment.ID != providerPaymentID ||
+		providerPayment.OrderID != localPayment.ProviderOrderID ||
+		providerPayment.Amount != localPayment.AmountMinor ||
+		!strings.EqualFold(
+			strings.TrimSpace(providerPayment.Currency),
+			strings.TrimSpace(localPayment.Currency),
+		) {
+		return Payment{}, errors.New(
+			"Razorpay payment details do not match local payment",
+		)
+	}
+
+	if providerPayment.Status != "captured" {
+		return Payment{}, errors.New("Razorpay payment is not captured")
+	}
+
+	// A succeeded payment is safe to return only if the identity matches.
+	if localPayment.Status == "succeeded" {
+		if localPayment.ProviderPaymentID != providerPayment.ID {
+			return Payment{}, errors.New(
+				"Razorpay payment ID does not match the reconciled payment",
+			)
+		}
+		return localPayment, nil
+	}
+
+	if localPayment.Status != "pending" {
+		return Payment{}, errors.New(
+			"only pending payments can be reconciled",
+		)
+	}
+
+	if err := s.repository.RecordPaymentAttempt(
+		ctx,
+		localPayment.ID,
+		"razorpay",
+		localPayment.ProviderOrderID,
+		providerPayment.ID,
+		localPayment.AmountMinor,
+		localPayment.Currency,
+		"captured",
+	); err != nil {
+		return Payment{}, err
+	}
+
+	if err := s.repository.AssociateProviderPayment(
+		ctx,
+		localPayment.ID,
+		localPayment.ProviderOrderID,
+		providerPayment.ID,
+		localPayment.AmountMinor,
+		localPayment.Currency,
+	); err != nil {
+		return Payment{}, err
+	}
+
+	// A deterministic event ID makes retries idempotent.
+	eventID := "admin_reconcile_" + providerPayment.ID
+	if err := s.repository.ProcessSuccessfulWebhook(
+		ctx,
+		"razorpay",
+		eventID,
+		"payment.captured",
+		providerPayment.ID,
+	); err != nil {
+		return Payment{}, err
+	}
+
+	return s.repository.GetAdminByID(ctx, localPayment.ID)
+}

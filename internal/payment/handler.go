@@ -254,3 +254,41 @@ func (h *Handler) AdminGetByID(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"data": payment})
 }
+
+func (h *Handler) AdminReconcileCapturedPayment(c *gin.Context) {
+	paymentID, err := uuid.Parse(c.Param("paymentID"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payment ID"})
+		return
+	}
+
+	var request struct {
+		RazorpayPaymentID string `json:"razorpay_payment_id" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "razorpay_payment_id is required"})
+		return
+	}
+
+	payment, err := h.service.ReconcileCapturedPayment(
+		c.Request.Context(),
+		paymentID,
+		request.RazorpayPaymentID,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrPaymentNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "payment not found"})
+		case errors.Is(err, ErrRazorpayNotConfigured):
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Razorpay is not configured"})
+		default:
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error": "could not reconcile captured payment",
+			})
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"data": payment})
+}

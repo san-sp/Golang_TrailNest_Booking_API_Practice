@@ -22,6 +22,7 @@ import (
 	"trailnest/internal/user"
 	"trailnest/internal/wishlist"
 
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 )
@@ -55,6 +56,25 @@ func main() {
 	gin.SetMode(cfg.GinMode)
 
 	router := gin.New()
+
+	router.Use(cors.New(cors.Config{
+		AllowOrigins: []string{
+			"http://localhost:8090",
+		},
+		AllowMethods: []string{
+			http.MethodGet,
+			http.MethodPost,
+			http.MethodPatch,
+			http.MethodDelete,
+			http.MethodOptions,
+		},
+		AllowHeaders: []string{
+			"Origin",
+			"Content-Type",
+			"Authorization",
+			"Idempotency-Key",
+		},
+	}))
 
 	// Assign the request ID before logging and handling the request.
 	router.Use(
@@ -188,27 +208,13 @@ func main() {
 	admin.GET("/users", adminUserHandler.List)
 	admin.GET("/users/:userID", adminUserHandler.GetByID)
 	admin.PATCH("/users/:userID/role", adminUserHandler.PromoteToOperator)
+	admin.POST("/payments/:paymentID/reconcile", paymentHandler.AdminReconcileCapturedPayment)
 
-	router.POST(
-		"/api/v1/auth/register",
-		middleware.MaxBodyBytes(1<<20),
-		registerHandler.Register,
-	)
-
-	router.POST(
-		"/api/v1/auth/login",
-		loginLimiter.Middleware(),
-		loginHandler.Login,
-	)
-
-	router.GET(
-		"/api/v1/auth/verify-email",
-		emailVerificationHandler.VerifyEmail,
-	)
-
-	router.POST(
-		"/api/v1/auth/resend-verification",
-		emailLimiter.Middleware(),
+	router.POST("/api/v1/auth/register", middleware.MaxBodyBytes(1<<20),
+		registerHandler.Register)
+	router.POST("/api/v1/auth/login", loginLimiter.Middleware(), loginHandler.Login)
+	router.GET("/api/v1/auth/verify-email", emailVerificationHandler.VerifyEmail)
+	router.POST("/api/v1/auth/resend-verification", emailLimiter.Middleware(),
 		resendVerificationHandler.Resend,
 	)
 

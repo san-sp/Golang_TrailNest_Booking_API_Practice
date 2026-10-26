@@ -1,7 +1,9 @@
 package middleware
 
 import (
+	"math"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -14,17 +16,20 @@ type rateLimitEntry struct {
 }
 
 type RateLimiter struct {
-	mu      sync.Mutex
-	entries map[string]rateLimitEntry
-	limit   int
-	window  time.Duration
+	mu              sync.Mutex
+	entries         map[string]rateLimitEntry
+	limit           int
+	window          time.Duration
+	lastCleanup     time.Time
+	cleanupInterval time.Duration
 }
 
 func NewRateLimiter(limit int, window time.Duration) *RateLimiter {
 	return &RateLimiter{
-		entries: make(map[string]rateLimitEntry),
-		limit:   limit,
-		window:  window,
+		entries:         make(map[string]rateLimitEntry),
+		limit:           limit,
+		window:          window,
+		cleanupInterval: time.Minute,
 	}
 }
 
@@ -40,19 +45,33 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 
 		rl.mu.Lock()
 
+		// Periodically remove expired entries to bound stale state.
+		if rl.lastCleanup.IsZero() ||
+			now.Sub(rl.lastCleanup) >= rl.cleanupInterval {
+			for ip, entry := range rl.entries {
+				if now.Sub(entry.windowStart) >= rl.window {
+					delete(rl.entries, ip)
+				}
+			}
+			rl.lastCleanup = now
+		}
+
 		entry, exists := rl.entries[key]
 		if !exists || now.Sub(entry.windowStart) >= rl.window {
-			entry = rateLimitEntry{
-				count:       0,
-				windowStart: now,
-			}
+			entry = rateLimitEntry{windowStart: now}
 		}
 
 		if entry.count >= rl.limit {
+			remaining := rl.window - now.Sub(entry.windowStart)
+			retryAfter := int(math.Ceil(remaining.Seconds()))
+			if retryAfter < 1 {
+				retryAfter = 1
+			}
+
 			rl.entries[key] = entry
 			rl.mu.Unlock()
 
-			c.Header("Retry-After", "60")
+			c.Header("Retry-After", strconv.Itoa(retryAfter))
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
 				"error": gin.H{
 					"code":    "RATE_LIMIT_EXCEEDED",

@@ -15,9 +15,12 @@ import (
 func openReservationTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 
-	databaseURL := strings.TrimSpace(os.Getenv("TEST_DATABASE_URL"))
+	databaseURL := strings.TrimSpace(os.Getenv("RESERVATION_TEST_DATABASE_URL"))
 	if databaseURL == "" {
-		t.Skip("TEST_DATABASE_URL is not set; skipping PostgreSQL integration test")
+		databaseURL = strings.TrimSpace(os.Getenv("TEST_DATABASE_URL"))
+	}
+	if databaseURL == "" {
+		t.Skip("RESERVATION_TEST_DATABASE_URL or TEST_DATABASE_URL is not set; skipping PostgreSQL integration test")
 	}
 
 	config, err := pgxpool.ParseConfig(databaseURL)

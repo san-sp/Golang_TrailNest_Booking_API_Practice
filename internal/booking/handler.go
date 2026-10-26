@@ -183,6 +183,14 @@ func (h *Handler) Cancel(c *gin.Context) {
 			response.Error(c, http.StatusNotFound, "BOOKING_NOT_FOUND", "Booking not found.", nil)
 		case errors.Is(err, ErrBookingAlreadyCancelled):
 			response.Error(c, http.StatusConflict, "BOOKING_ALREADY_CANCELLED", "This booking has already been cancelled.", nil)
+		case errors.Is(err, ErrCancellationDeadlinePassed):
+			response.Error(
+				c,
+				http.StatusConflict,
+				"CANCELLATION_DEADLINE_PASSED",
+				"The cancellation deadline has passed.",
+				nil,
+			)
 		default:
 			slog.Error("cancel booking failed", "error", err)
 			response.Internal(c)

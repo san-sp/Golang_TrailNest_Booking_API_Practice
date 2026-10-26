@@ -399,3 +399,53 @@ func TestFindPaymentLinkByReferenceIDMalformedResponse(t *testing.T) {
 		t.Fatal("malformed response must not be treated as a missing link")
 	}
 }
+
+func TestFetchPaymentCaptured(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %q, want GET", r.Method)
+		}
+
+		if r.URL.Path != "/v1/payments/pay_test123" {
+			t.Errorf("path = %q, want /v1/payments/pay_test123", r.URL.Path)
+		}
+
+		username, password, ok := r.BasicAuth()
+		if !ok || username != "test_key" || password != "test_secret" {
+			t.Error("request has incorrect Basic Auth credentials")
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(RazorpayPayment{
+			ID:       "pay_test123",
+			OrderID:  "order_test123",
+			Amount:   50000,
+			Currency: "INR",
+			Status:   "captured",
+		})
+	}))
+	defer server.Close()
+
+	client := &RazorpayClient{
+		keyID:      "test_key",
+		keySecret:  "test_secret",
+		http:       server.Client(),
+		apiBaseURL: server.URL,
+	}
+
+	got, err := client.FetchPayment(t.Context(), "pay_test123")
+	if err != nil {
+		t.Fatalf("FetchPayment() error = %v", err)
+	}
+
+	if got.ID != "pay_test123" ||
+		got.OrderID != "order_test123" ||
+		got.Amount != 50000 ||
+		got.Currency != "INR" ||
+		got.Status != "captured" {
+		t.Fatalf("unexpected payment returned: %+v", got)
+	}
+}

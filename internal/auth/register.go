@@ -52,7 +52,20 @@ func (h *RegisterHandler) Register(c *gin.Context) {
 	decoder.DisallowUnknownFields()
 
 	var input registerRequest
+
 	if err := decoder.Decode(&input); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			response.Error(
+				c,
+				http.StatusRequestEntityTooLarge,
+				"REQUEST_TOO_LARGE",
+				"Request body exceeds the maximum allowed size.",
+				nil,
+			)
+			return
+		}
+
 		response.Error(
 			c,
 			http.StatusBadRequest,
@@ -66,7 +79,20 @@ func (h *RegisterHandler) Register(c *gin.Context) {
 	// A second decode must reach EOF; otherwise the body contains
 	// trailing data or another JSON value.
 	var extra any
+
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			response.Error(
+				c,
+				http.StatusRequestEntityTooLarge,
+				"REQUEST_TOO_LARGE",
+				"Request body exceeds the maximum allowed size.",
+				nil,
+			)
+			return
+		}
+
 		response.Error(
 			c,
 			http.StatusBadRequest,

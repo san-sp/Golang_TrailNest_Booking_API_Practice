@@ -1,9 +1,10 @@
 Our next phase: Core booking features
 Here's the order I'd suggest, bro. We'll verify each feature against the code before implementing anything, so we don't duplicate work.
 
-1. Reservation lifecycle and expiry
-   Next to inspect
-   Ensure expired reservations are transitioned safely, capacity is released, and background processing is reliable.
+# Completed: 1. Reservation lifecycle and expiry
+
+Next to inspect
+Ensure expired reservations are transitioned safely, capacity is released, and background processing is reliable.
 
 2. Booking lifecycle
 
@@ -93,3 +94,49 @@ Yes! Let's include it—but make it a proper test rather than just a README clai
   Bro, before we start implementing the expanded roadmap, let's inspect the current reservation and booking code, as we planned. Then we'll mark each item as done, partially done, or missing and create a realistic implementation sequence.
 
 That way, we won't lose track of our existing work or turn this into an endless project. ❤️
+
+<!-- --------------------------------------- -->
+
+# What we have completed
+
+## `1. Reservation expiry feature`
+
+`What we've accomplished`
+The reservation expiry feature now has three important pieces:
+
+1. Database logic: finds overdue pending reservations and expires them in bounded batches.
+2. Background worker: processes overdue reservations periodically without waiting for an incoming HTTP request.
+3. Graceful shutdown integration: the API signals the worker to stop and waits for it during shutdown.
+
+# ## Advanced payment work — progress update
+
+### Completed: Captured payment reconciliation
+
+- Verified the existing ₹500 Razorpay Test Mode payment.
+- Implemented an admin reconciliation endpoint that fetches and validates the provider payment before updating local state.
+- Successfully reconciled the captured payment without creating another charge.
+- Confirmed local payment status is `succeeded`.
+- Confirmed fulfillment status is `refund_required` because the reservation had expired.
+- Verified that the reservation remains `expired` and no booking was created.
+- Applied database migrations 11 and 12 to the Docker `trailnest` database.
+- Added reconciliation integration tests and a Razorpay payment-fetch test; the full Go test suite passed before the live reconciliation.
+
+### Pending: Refund completion
+
+- Implement and verify the intended refund workflow.
+- Execute a refund through the appropriate Razorpay Test Mode workflow.
+- Confirm the provider's refund result and update local refund state consistently.
+- Add tests for refund retries, provider failures, and idempotency.
+
+### Pending: Final payment reliability checks
+
+- Test repeated reconciliation requests.
+- Test provider timeouts and mismatched payment details.
+- Verify webhook retries and duplicate-event handling.
+- Review concurrent reconciliation attempts and payment state transitions.
+
+**Priority:** Finish the core booking system first. Resume advanced payment work afterward, beginning with the pending refund workflow.
+
+# What are we going to implement next?
+
+`Booking lifecycle`

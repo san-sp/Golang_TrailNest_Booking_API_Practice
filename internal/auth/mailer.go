@@ -101,6 +101,7 @@ func (m *EmailMailer) SendVerificationEmail(
 
 	req.Header.Set("Authorization", "Bearer "+m.apiKey)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "TrailNest/1.0")
 
 	resp, err := m.client.Do(req)
 	if err != nil {

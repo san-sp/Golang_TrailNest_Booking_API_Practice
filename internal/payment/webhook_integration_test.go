@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"trailnest/internal/reservation"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -679,7 +680,11 @@ func TestRecordPaymentLinkAttemptRejectsMismatchedLink(t *testing.T) {
 	require.Equal(t, linkID, savedLinkID)
 }
 
-func installBookingInsertFailure(t *testing.T, pool *pgxpool.Pool) {
+func installBookingInsertFailure(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	reservationID uuid.UUID,
+) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -690,7 +695,11 @@ func installBookingInsertFailure(t *testing.T, pool *pgxpool.Pool) {
 		LANGUAGE plpgsql
 		AS $$
 		BEGIN
-			RAISE EXCEPTION 'intentional booking insert failure for integration test';
+			IF NEW.reservation_id = '`+reservationID.String()+`'::uuid THEN
+				RAISE EXCEPTION 'intentional booking insert failure for integration test';
+			END IF;
+
+			RETURN NEW;
 		END;
 		$$;
 
@@ -951,7 +960,7 @@ func TestPaymentLinkPaidWebhookRetriesAfterFulfillmentFailure(t *testing.T) {
 	}
 
 	// Force booking creation to fail inside the fulfillment transaction.
-	installBookingInsertFailure(t, pool)
+	installBookingInsertFailure(t, pool, f.reservationID)
 
 	firstResponse := sendWebhook()
 	require.Equal(
@@ -1077,6 +1086,77 @@ func TestPaymentLinkPaidWebhookRetriesAfterFulfillmentFailure(t *testing.T) {
 	`, eventID).Scan(&processedEventCount)
 	require.NoError(t, err)
 	require.Equal(t, 1, processedEventCount)
+}
+
+func TestConcurrentWebhookAndReservationExpiryStayConsistent(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+	f := createWebhookFixture(t, pool)
+
+	// Make the reservation overdue so the expiry worker and webhook
+	// compete for the same activity and reservation.
+	_, err := pool.Exec(ctx, `
+		UPDATE reservations
+		SET expires_at = NOW() - INTERVAL '100 years'
+		WHERE id = $1
+	`, f.reservationID)
+	require.NoError(t, err)
+
+	paymentRepo := NewRepository(pool)
+	reservationRepo := reservation.NewRepository(pool)
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+
+	go func() {
+		<-start
+		errs <- paymentRepo.ProcessSuccessfulWebhook(
+			ctx,
+			"mock",
+			"event_"+uuid.NewString(),
+			"payment.succeeded",
+			f.providerPaymentID,
+		)
+	}()
+
+	go func() {
+		<-start
+		_, err := reservationRepo.ExpireOverdue(ctx, 10)
+		errs <- err
+	}()
+	close(start)
+
+	require.NoError(t, <-errs)
+	require.NoError(t, <-errs)
+
+	var reservationStatus, paymentStatus, fulfillmentStatus string
+
+	err = pool.QueryRow(ctx, `
+		SELECT status
+		FROM reservations
+		WHERE id = $1
+	`, f.reservationID).Scan(&reservationStatus)
+	require.NoError(t, err)
+	require.Equal(t, "expired", reservationStatus)
+
+	err = pool.QueryRow(ctx, `
+		SELECT status, fulfillment_status
+		FROM payments
+		WHERE id = $1
+	`, f.paymentID).Scan(&paymentStatus, &fulfillmentStatus)
+	require.NoError(t, err)
+	require.Equal(t, "succeeded", paymentStatus)
+	require.Equal(t, "refund_required", fulfillmentStatus)
+
+	var bookingCount int
+	err = pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM bookings
+		WHERE reservation_id = $1
+		  AND status = 'confirmed'
+	`, f.reservationID).Scan(&bookingCount)
+	require.NoError(t, err)
+	require.Zero(t, bookingCount)
 }
 
 func TestCreatePaymentRejectsHostedPaymentLink(t *testing.T) {

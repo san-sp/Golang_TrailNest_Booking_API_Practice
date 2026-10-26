@@ -443,3 +443,50 @@ I can design and build a similar API independently.
 <!--
 export TEST_DATABASE_URL="$(python3 -c 'import os; from urllib.parse import urlsplit, urlunsplit; u=urlsplit(os.environ["DATABASE_URL"]); print(urlunsplit((u.scheme, u.netloc, "/trailnest_test", u.query, u.fragment)))')"
  -->
+
+# Test Runner:
+
+chmod +x scripts/test.sh
+./scripts/test.sh
+
+[if it shows error like: ERROR: ORIGINAL_TEST_DATABASE_URL is not set.
+Set it to your trailnest_test connection URL.]
+
+---
+
+`Step 1 — Load your environment variables`
+
+```
+set -a
+source .env
+set +a
+```
+
+---
+
+`Step 2 — Set the two test database URLs:`
+
+```
+export ORIGINAL_TEST_DATABASE_URL="$TEST_DATABASE_URL"
+export EXPIRY_DATABASE_URL="${TEST_DATABASE_URL%/*}/trailnest_expiry_test"
+```
+
+---
+
+`Let's verify the database names without printing credentials:`
+
+```
+psql "$ORIGINAL_TEST_DATABASE_URL" -Atc 'SELECT current_database();'
+psql "$EXPIRY_DATABASE_URL" -Atc 'SELECT current_database();'
+```
+
+```
+Expected output:
+trailnest_test
+trailnest_expiry_test
+```
+
+---
+
+`Step 3 — Run the test script:`
+./scripts/test.sh

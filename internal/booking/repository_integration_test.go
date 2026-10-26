@@ -225,25 +225,50 @@ func TestCreateConcurrentBookingsRespectCapacity(t *testing.T) {
 	pool := openBookingTestPool(t)
 	repo := NewRepository(pool)
 
+	const customerCount = 50
+
 	ownerID, activityID := createBookingActivityFixture(
 		t,
 		pool,
 		"published",
 	)
 
-	customerID1 := uuid.New()
-	customerID2 := uuid.New()
+	customerIDs := make([]uuid.UUID, customerCount)
 
-	for _, customerID := range []uuid.UUID{customerID1, customerID2} {
+	for i := range customerIDs {
+		customerIDs[i] = uuid.New()
+
 		_, err := pool.Exec(
 			t.Context(),
 			`INSERT INTO users (id, email, password_hash, role, email_verified)
 			 VALUES ($1, $2, 'test-hash', 'customer', TRUE)`,
-			customerID,
+			customerIDs[i],
 			uuid.NewString()+"@example.test",
 		)
 		require.NoError(t, err)
 
+		customerID := customerIDs[i]
+		t.Cleanup(func() {
+			cleanupCtx, cancel := context.WithTimeout(
+				context.Background(),
+				5*time.Second,
+			)
+			defer cancel()
+
+			_, err := pool.Exec(
+				cleanupCtx,
+				`DELETE FROM bookings WHERE customer_id = $1`,
+				customerID,
+			)
+			require.NoError(t, err)
+
+			_, err = pool.Exec(
+				cleanupCtx,
+				`DELETE FROM users WHERE id = $1`,
+				customerID,
+			)
+			require.NoError(t, err)
+		})
 	}
 
 	// The activity has capacity 10. Reserve 9 seats first.
@@ -261,11 +286,11 @@ func TestCreateConcurrentBookingsRespectCapacity(t *testing.T) {
 	}
 
 	start := make(chan struct{})
-	results := make(chan result, 2)
+	results := make(chan result, customerCount)
 
 	var wg sync.WaitGroup
 
-	for _, customerID := range []uuid.UUID{customerID1, customerID2} {
+	for _, customerID := range customerIDs {
 		wg.Add(1)
 
 		go func(customerID uuid.UUID) {
@@ -301,7 +326,7 @@ func TestCreateConcurrentBookingsRespectCapacity(t *testing.T) {
 	}
 
 	require.Equal(t, 1, successes)
-	require.Equal(t, 1, capacityErrors)
+	require.Equal(t, customerCount-1, capacityErrors)
 
 	var bookedQuantity int
 	err = pool.QueryRow(
@@ -314,25 +339,6 @@ func TestCreateConcurrentBookingsRespectCapacity(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, 10, bookedQuantity)
-	cleanupCtx, cancel := context.WithTimeout(
-		context.Background(),
-		5*time.Second,
-	)
-	defer cancel()
-
-	_, err = pool.Exec(
-		cleanupCtx,
-		`DELETE FROM bookings WHERE activity_id = $1`,
-		activityID,
-	)
-	require.NoError(t, err)
-
-	_, err = pool.Exec(
-		cleanupCtx,
-		`DELETE FROM users WHERE id = ANY($1)`,
-		[]uuid.UUID{customerID1, customerID2},
-	)
-	require.NoError(t, err)
 }
 
 func TestCancelBookingSuccessfully(t *testing.T) {
@@ -393,6 +399,75 @@ func TestCancelBookingTwiceReturnsError(t *testing.T) {
 	require.ErrorIs(t, err, ErrBookingAlreadyCancelled)
 }
 
+func TestConcurrentBookingCancellationsOnlyCancelOnce(t *testing.T) {
+	pool := openBookingTestPool(t)
+	repo := NewRepository(pool)
+
+	customerID, activityID := createBookingActivityFixture(
+		t,
+		pool,
+		"published",
+	)
+
+	created, err := repo.Create(t.Context(), customerID, activityID, 3)
+	require.NoError(t, err)
+
+	const attempts = 2
+	start := make(chan struct{})
+	results := make(chan error, attempts)
+
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- repo.Cancel(t.Context(), customerID, created.ID)
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(results)
+
+	successes := 0
+	alreadyCancelled := 0
+
+	for err := range results {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrBookingAlreadyCancelled):
+			alreadyCancelled++
+		default:
+			t.Fatalf("unexpected cancellation error: %v", err)
+		}
+	}
+
+	require.Equal(t, 1, successes)
+	require.Equal(t, 1, alreadyCancelled)
+
+	var status string
+	err = pool.QueryRow(
+		t.Context(),
+		`SELECT status FROM bookings WHERE id = $1`,
+		created.ID,
+	).Scan(&status)
+	require.NoError(t, err)
+	require.Equal(t, "cancelled", status)
+
+	var bookedQuantity int
+	err = pool.QueryRow(
+		t.Context(),
+		`SELECT COALESCE(SUM(quantity), 0)::INTEGER
+		 FROM bookings
+		 WHERE activity_id = $1 AND status = 'confirmed'`,
+		activityID,
+	).Scan(&bookedQuantity)
+	require.NoError(t, err)
+	require.Equal(t, 0, bookedQuantity)
+}
+
 func TestCancelledBookingReleasesCapacity(t *testing.T) {
 	pool := openBookingTestPool(t)
 	repo := NewRepository(pool)
@@ -424,6 +499,124 @@ func TestCancelledBookingReleasesCapacity(t *testing.T) {
 
 	require.Equal(t, 10, secondBooking.Quantity)
 	require.Equal(t, "confirmed", secondBooking.Status)
+}
+
+func TestCancelBookingWithin24HoursReturnsDeadlineError(t *testing.T) {
+	pool := openBookingTestPool(t)
+	repo := NewRepository(pool)
+
+	customerID, activityID := createBookingActivityFixture(
+		t,
+		pool,
+		"published",
+	)
+
+	created, err := repo.Create(
+		t.Context(),
+		customerID,
+		activityID,
+		1,
+	)
+	require.NoError(t, err)
+
+	// Move the activity inside the 24-hour cancellation window.
+	_, err = pool.Exec(
+		t.Context(),
+		`UPDATE activities
+		 SET starts_at = NOW() + INTERVAL '12 hours'
+		 WHERE id = $1`,
+		activityID,
+	)
+	require.NoError(t, err)
+
+	err = repo.Cancel(t.Context(), customerID, created.ID)
+	require.ErrorIs(t, err, ErrCancellationDeadlinePassed)
+
+	// A rejected cancellation must not change the booking.
+	var status string
+	err = pool.QueryRow(
+		t.Context(),
+		`SELECT status FROM bookings WHERE id = $1`,
+		created.ID,
+	).Scan(&status)
+
+	require.NoError(t, err)
+	require.Equal(t, "confirmed", status)
+}
+
+func TestCancelBookingAfterCancellationDeadlineReturnsError(t *testing.T) {
+	pool := openBookingTestPool(t)
+	repo := NewRepository(pool)
+
+	customerID, activityID := createBookingActivityFixture(
+		t,
+		pool,
+		"published",
+	)
+
+	created, err := repo.Create(
+		t.Context(),
+		customerID,
+		activityID,
+		1,
+	)
+	require.NoError(t, err)
+
+	// The activity starts in 23 hours, so the 24-hour
+	// cancellation deadline has already passed.
+	_, err = pool.Exec(
+		t.Context(),
+		`UPDATE activities
+		 SET starts_at = NOW() + INTERVAL '23 hours'
+		 WHERE id = $1`,
+		activityID,
+	)
+	require.NoError(t, err)
+
+	err = repo.Cancel(t.Context(), customerID, created.ID)
+	require.ErrorIs(t, err, ErrCancellationDeadlinePassed)
+
+	var status string
+	err = pool.QueryRow(
+		t.Context(),
+		`SELECT status FROM bookings WHERE id = $1`,
+		created.ID,
+	).Scan(&status)
+
+	require.NoError(t, err)
+	require.Equal(t, "confirmed", status)
+}
+
+func TestCancelBookingTwiceAfterDeadlineReturnsAlreadyCancelled(t *testing.T) {
+	pool := openBookingTestPool(t)
+	repo := NewRepository(pool)
+
+	customerID, activityID := createBookingActivityFixture(
+		t,
+		pool,
+		"published",
+	)
+
+	created, err := repo.Create(t.Context(), customerID, activityID, 1)
+	require.NoError(t, err)
+
+	// Cancel while the activity is outside the deadline.
+	err = repo.Cancel(t.Context(), customerID, created.ID)
+	require.NoError(t, err)
+
+	// Move the activity inside the 24-hour cancellation window.
+	_, err = pool.Exec(
+		t.Context(),
+		`UPDATE activities
+		 SET starts_at = NOW() + INTERVAL '12 hours'
+		 WHERE id = $1`,
+		activityID,
+	)
+	require.NoError(t, err)
+
+	// Booking state takes precedence over the deadline error.
+	err = repo.Cancel(t.Context(), customerID, created.ID)
+	require.ErrorIs(t, err, ErrBookingAlreadyCancelled)
 }
 
 func TestGetByIDRejectsAnotherCustomersBooking(t *testing.T) {
