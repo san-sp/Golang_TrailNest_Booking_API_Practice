@@ -16,3 +16,6 @@
 .DS_Store
 
 .md.env.docker
+
+# Temporary local files
+/tmp/
