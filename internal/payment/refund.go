@@ -30,6 +30,15 @@ type RefundLookupProvider interface {
 	) (RazorpayRefund, error)
 }
 
+type RefundListProvider interface {
+	ListPaymentRefunds(
+		ctx context.Context,
+		paymentID string,
+		count int,
+		skip int,
+	) ([]RazorpayRefund, error)
+}
+
 type RefundWorker struct {
 	repository *Repository
 	provider   RefundProvider

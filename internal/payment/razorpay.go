@@ -474,6 +474,11 @@ type RazorpayRefund struct {
 	Notes     map[string]string `json:"notes"`
 }
 
+type razorpayRefundListResponse struct {
+	Items []RazorpayRefund `json:"items"`
+	Count int              `json:"count"`
+}
+
 type razorpayRefundRequest struct {
 	Amount int64             `json:"amount"`
 	Notes  map[string]string `json:"notes"`
@@ -639,4 +644,84 @@ func (c *RazorpayClient) FetchRefund(
 	}
 
 	return result, nil
+}
+
+func (c *RazorpayClient) ListPaymentRefunds(
+	ctx context.Context,
+	paymentID string,
+	count int,
+	skip int,
+) ([]RazorpayRefund, error) {
+	paymentID = strings.TrimSpace(paymentID)
+
+	if paymentID == "" || strings.Contains(paymentID, "/") {
+		return nil, errors.New("invalid Razorpay payment ID")
+	}
+	if count < 1 || count > 100 {
+		return nil, errors.New("refund list count must be between 1 and 100")
+	}
+	if skip < 0 {
+		return nil, errors.New("refund list skip must not be negative")
+	}
+
+	endpoint := strings.TrimRight(c.apiBaseURL, "/") +
+		"/v1/payments/" + paymentID + "/refunds"
+
+	query := url.Values{}
+	query.Set("count", fmt.Sprintf("%d", count))
+	query.Set("skip", fmt.Sprintf("%d", skip))
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		endpoint+"?"+query.Encode(),
+		nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("build Razorpay refund list request: %w", err)
+	}
+
+	req.SetBasicAuth(c.keyID, c.keySecret)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list Razorpay payment refunds: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read Razorpay refund list response: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf(
+			"Razorpay refund list failed with HTTP status %d",
+			resp.StatusCode,
+		)
+	}
+
+	var result razorpayRefundListResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("decode Razorpay refund list: %w", err)
+	}
+
+	for _, refund := range result.Items {
+		if refund.ID == "" || refund.PaymentID != paymentID {
+			return nil, errors.New("Razorpay refund list returned mismatched data")
+		}
+		if refund.Amount <= 0 {
+			return nil, errors.New("Razorpay refund list returned invalid amount")
+		}
+		if refund.Currency == "" {
+			return nil, errors.New("Razorpay refund list returned missing currency")
+		}
+		if refund.Status != "pending" &&
+			refund.Status != "processed" &&
+			refund.Status != "failed" {
+			return nil, errors.New("Razorpay refund list returned unexpected status")
+		}
+	}
+
+	return result.Items, nil
 }

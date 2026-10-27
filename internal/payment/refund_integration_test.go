@@ -20,6 +20,31 @@ type fakeRefundProvider struct {
 	fetchedRefund RazorpayRefund
 	fetchErr      error
 	fetchCalls    int
+	listedRefunds []RazorpayRefund
+	listErr       error
+	listCalls     int
+}
+
+func (f *fakeRefundProvider) ListPaymentRefunds(
+	ctx context.Context,
+	paymentID string,
+	count int,
+	skip int,
+) ([]RazorpayRefund, error) {
+	f.listCalls++
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	if skip >= len(f.listedRefunds) {
+		return []RazorpayRefund{}, nil
+	}
+
+	end := skip + count
+	if end > len(f.listedRefunds) {
+		end = len(f.listedRefunds)
+	}
+
+	return f.listedRefunds[skip:end], nil
 }
 
 func (f *fakeRefundProvider) CreateRefund(

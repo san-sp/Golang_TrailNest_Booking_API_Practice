@@ -277,6 +277,22 @@ func main() {
 		)
 	}()
 
+	refundWorker := payment.NewRefundWorker(
+		paymentRepository,
+		razorpayClient,
+	)
+
+	workerWG.Add(1)
+	go func() {
+		defer workerWG.Done()
+
+		payment.RunRefundWorker(
+			shutdownCtx,
+			refundWorker,
+			5*time.Second,
+		)
+	}()
+
 	serverErrors := make(chan error, 1)
 
 	go func() {

@@ -599,6 +599,65 @@ func TestFetchRefundSuccess(t *testing.T) {
 	}
 }
 
+func TestListPaymentRefundsSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %q, want GET", r.Method)
+		}
+		if r.URL.Path != "/v1/payments/pay_test123/refunds" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if r.URL.Query().Get("count") != "100" {
+			t.Errorf("count = %q, want 100", r.URL.Query().Get("count"))
+		}
+		if r.URL.Query().Get("skip") != "20" {
+			t.Errorf("skip = %q, want 20", r.URL.Query().Get("skip"))
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"entity": "collection",
+			"count": 1,
+			"items": [{
+				"id": "rfnd_test123",
+				"payment_id": "pay_test123",
+				"amount": 50000,
+				"currency": "INR",
+				"status": "processed",
+				"notes": {"trailnest_refund_id": "internal-refund-123"}
+			}]
+		}`))
+	}))
+	defer server.Close()
+
+	client := &RazorpayClient{
+		keyID:      "test_key",
+		keySecret:  "test_secret",
+		http:       server.Client(),
+		apiBaseURL: server.URL,
+	}
+
+	got, err := client.ListPaymentRefunds(
+		t.Context(),
+		"pay_test123",
+		100,
+		20,
+	)
+	if err != nil {
+		t.Fatalf("ListPaymentRefunds() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d refunds, want 1", len(got))
+	}
+	if got[0].ID != "rfnd_test123" ||
+		got[0].Notes["trailnest_refund_id"] != "internal-refund-123" {
+		t.Fatalf("unexpected refund: %+v", got[0])
+	}
+}
+
 func TestFetchRefundRejectsInvalidID(t *testing.T) {
 	client := &RazorpayClient{
 		keyID:      "test_key",
