@@ -1642,4 +1642,130 @@ func TestSuccessfulPaymentWithExpiredReservationRequiresRefund(t *testing.T) {
     `, "mock", eventID).Scan(&eventStatus)
 	require.NoError(t, err)
 	require.Equal(t, "processed", eventStatus)
+
+	var refundCount int
+	var refundProvider string
+	var refundProviderPaymentID string
+	var refundIdempotencyKey string
+	var refundAmount int64
+	var refundCurrency string
+	var refundStatus string
+
+	err = pool.QueryRow(ctx, `
+                SELECT
+                        COUNT(*),
+                        COALESCE(MAX(provider), ''),
+                        COALESCE(MAX(provider_payment_id), ''),
+                        COALESCE(MAX(idempotency_key), ''),
+                        COALESCE(MAX(amount_minor), 0),
+                        COALESCE(MAX(currency), ''),
+                        COALESCE(MAX(status), '')
+                FROM payment_refunds
+                WHERE payment_id = $1
+        `, f.paymentID).Scan(
+		&refundCount,
+		&refundProvider,
+		&refundProviderPaymentID,
+		&refundIdempotencyKey,
+		&refundAmount,
+		&refundCurrency,
+		&refundStatus,
+	)
+	require.NoError(t, err)
+
+	require.Equal(t, 1, refundCount)
+	require.Equal(t, "mock", refundProvider)
+	require.Equal(t, f.providerPaymentID, refundProviderPaymentID)
+	require.Equal(t, "trailnest-refund-"+f.paymentID.String(), refundIdempotencyKey)
+	require.Positive(t, refundAmount)
+	require.Equal(t, "INR", refundCurrency)
+	require.Equal(t, "pending", refundStatus)
+}
+
+func TestSuccessfulPaymentRejectsConflictingRefundJob(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+
+	f := createWebhookFixture(t, pool)
+	repo := NewRepository(pool)
+
+	// Expire the reservation so the successful payment requires a refund.
+	_, err := pool.Exec(ctx, `
+		UPDATE reservations
+		SET expires_at = NOW() - INTERVAL '1 minute'
+		WHERE id = $1
+	`, f.reservationID)
+	require.NoError(t, err)
+
+	// Insert a conflicting refund job for this payment.
+	_, err = pool.Exec(ctx, `
+		INSERT INTO payment_refunds (
+			payment_id,
+			provider,
+			provider_payment_id,
+			idempotency_key,
+			amount_minor,
+			currency,
+			status
+		)
+		VALUES ($1, 'mock', $2, $3, 1, 'INR', 'pending')
+	`,
+		f.paymentID,
+		f.providerPaymentID,
+		"conflicting-refund-"+f.paymentID.String(),
+	)
+	require.NoError(t, err)
+
+	eventID := "event_" + uuid.NewString()
+
+	err = repo.ProcessSuccessfulWebhook(
+		ctx,
+		"mock",
+		eventID,
+		"payment.succeeded",
+		f.providerPaymentID,
+	)
+	require.ErrorContains(t, err, "existing refund job does not match payment")
+
+	// The payment update must roll back.
+	var paymentStatus, fulfillmentStatus string
+	err = pool.QueryRow(ctx, `
+		SELECT status, fulfillment_status
+		FROM payments
+		WHERE id = $1
+	`, f.paymentID).Scan(&paymentStatus, &fulfillmentStatus)
+	require.NoError(t, err)
+	require.Equal(t, "pending", paymentStatus)
+	require.Equal(t, "pending", fulfillmentStatus)
+
+	// The pre-existing conflicting refund job must remain unchanged.
+	var refundCount int
+	var refundAmount int64
+	var refundIdempotencyKey string
+
+	err = pool.QueryRow(ctx, `
+		SELECT COUNT(*),
+		       COALESCE(MAX(amount_minor), 0),
+		       COALESCE(MAX(idempotency_key), '')
+		FROM payment_refunds
+		WHERE payment_id = $1
+	`, f.paymentID).Scan(
+		&refundCount,
+		&refundAmount,
+		&refundIdempotencyKey,
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1, refundCount)
+	require.EqualValues(t, 1, refundAmount)
+	require.Equal(t, "conflicting-refund-"+f.paymentID.String(), refundIdempotencyKey)
+
+	// The failed event must not be marked processed.
+	var eventCount int
+	err = pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM payment_webhook_events
+		WHERE provider = $1 AND provider_event_id = $2
+	`, "mock", eventID).Scan(&eventCount)
+	require.NoError(t, err)
+	require.Zero(t, eventCount)
 }

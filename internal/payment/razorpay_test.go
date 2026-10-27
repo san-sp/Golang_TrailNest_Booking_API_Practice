@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestCreatePaymentLinkSuccess(t *testing.T) {
@@ -447,5 +448,263 @@ func TestFetchPaymentCaptured(t *testing.T) {
 		got.Currency != "INR" ||
 		got.Status != "captured" {
 		t.Fatalf("unexpected payment returned: %+v", got)
+	}
+}
+
+func TestCreateRefundSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %q, want POST", r.Method)
+		}
+		if r.URL.Path != "/v1/payments/pay_test123/refund" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if got := r.Header.Get("X-Refund-Idempotency"); got != "trailnest-refund-123" {
+			t.Errorf("idempotency header = %q", got)
+		}
+
+		username, password, ok := r.BasicAuth()
+		if !ok || username != "test_key" || password != "test_secret" {
+			t.Error("incorrect Basic Auth credentials")
+		}
+
+		var request razorpayRefundRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		if request.Amount != 50000 {
+			t.Errorf("amount = %d, want 50000", request.Amount)
+		}
+		if request.Notes["trailnest_refund_id"] != "internal-refund-123" {
+			t.Errorf("unexpected refund notes: %+v", request.Notes)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(RazorpayRefund{
+			ID:        "rfnd_test123",
+			PaymentID: "pay_test123",
+			Amount:    50000,
+			Currency:  "INR",
+			Status:    "processed",
+		})
+	}))
+	defer server.Close()
+
+	client := &RazorpayClient{
+		keyID:      "test_key",
+		keySecret:  "test_secret",
+		http:       server.Client(),
+		apiBaseURL: server.URL,
+	}
+
+	got, err := client.CreateRefund(
+		t.Context(),
+		"pay_test123",
+		50000,
+		"trailnest-refund-123",
+		"internal-refund-123",
+	)
+	if err != nil {
+		t.Fatalf("CreateRefund() error = %v", err)
+	}
+	if got.ID != "rfnd_test123" ||
+		got.PaymentID != "pay_test123" ||
+		got.Amount != 50000 ||
+		got.Status != "processed" {
+		t.Fatalf("unexpected refund: %+v", got)
+	}
+}
+
+func TestCreateRefundRejectsInvalidInput(t *testing.T) {
+	client := &RazorpayClient{
+		keyID:      "test_key",
+		keySecret:  "test_secret",
+		apiBaseURL: "https://example.invalid",
+	}
+
+	tests := []struct {
+		name           string
+		paymentID      string
+		amount         int64
+		idempotencyKey string
+		internalID     string
+	}{
+		{"empty payment ID", "", 50000, "trailnest-refund-123", "internal-123"},
+		{"invalid payment ID", "pay_test123/extra", 50000, "trailnest-refund-123", "internal-123"},
+		{"zero amount", "pay_test123", 0, "trailnest-refund-123", "internal-123"},
+		{"short idempotency key", "pay_test123", 50000, "short", "internal-123"},
+		{"invalid idempotency key", "pay_test123", 50000, "trailnest/refund", "internal-123"},
+		{"empty internal ID", "pay_test123", 50000, "trailnest-refund-123", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := client.CreateRefund(
+				t.Context(),
+				tt.paymentID,
+				tt.amount,
+				tt.idempotencyKey,
+				tt.internalID,
+			)
+			if err == nil {
+				t.Fatal("expected invalid input to be rejected")
+			}
+		})
+	}
+}
+
+func TestFetchRefundSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %q, want GET", r.Method)
+		}
+		if r.URL.Path != "/v1/refunds/rfnd_test123" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(RazorpayRefund{
+			ID:        "rfnd_test123",
+			PaymentID: "pay_test123",
+			Amount:    50000,
+			Currency:  "INR",
+			Status:    "processed",
+		})
+	}))
+	defer server.Close()
+
+	client := &RazorpayClient{
+		keyID:      "test_key",
+		keySecret:  "test_secret",
+		http:       server.Client(),
+		apiBaseURL: server.URL,
+	}
+
+	got, err := client.FetchRefund(t.Context(), "rfnd_test123")
+	if err != nil {
+		t.Fatalf("FetchRefund() error = %v", err)
+	}
+	if got.ID != "rfnd_test123" ||
+		got.PaymentID != "pay_test123" ||
+		got.Status != "processed" {
+		t.Fatalf("unexpected refund: %+v", got)
+	}
+}
+
+func TestFetchRefundRejectsInvalidID(t *testing.T) {
+	client := &RazorpayClient{
+		keyID:      "test_key",
+		keySecret:  "test_secret",
+		apiBaseURL: "https://example.invalid",
+	}
+
+	_, err := client.FetchRefund(t.Context(), "rfnd_test123/extra")
+	if err == nil {
+		t.Fatal("expected invalid refund ID to be rejected")
+	}
+}
+
+func TestCreateRefundRejectsProviderError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		http.Error(w, `{"error":"refund rejected"}`, http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	client := &RazorpayClient{
+		keyID:      "test_key",
+		keySecret:  "test_secret",
+		http:       server.Client(),
+		apiBaseURL: server.URL,
+	}
+
+	_, err := client.CreateRefund(
+		t.Context(),
+		"pay_test123",
+		50000,
+		"trailnest-refund-123",
+		"internal-refund-123",
+	)
+	if err == nil {
+		t.Fatal("expected provider error to be returned")
+	}
+}
+
+func TestCreateRefundRejectsMismatchedResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(RazorpayRefund{
+			ID:        "rfnd_test123",
+			PaymentID: "pay_different",
+			Amount:    50000,
+			Currency:  "INR",
+			Status:    "processed",
+		})
+	}))
+	defer server.Close()
+
+	client := &RazorpayClient{
+		keyID:      "test_key",
+		keySecret:  "test_secret",
+		http:       server.Client(),
+		apiBaseURL: server.URL,
+	}
+
+	_, err := client.CreateRefund(
+		t.Context(),
+		"pay_test123",
+		50000,
+		"trailnest-refund-123",
+		"internal-refund-123",
+	)
+	if err == nil {
+		t.Fatal("expected mismatched payment ID to be rejected")
+	}
+}
+
+func TestCreateRefundHonorsContextTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		// Deliberately delay the response.
+		time.Sleep(200 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"rfnd_test123","payment_id":"pay_test123","amount":50000,"currency":"INR","status":"processed"}`))
+	}))
+	defer server.Close()
+
+	client := &RazorpayClient{
+		keyID:      "test_key",
+		keySecret:  "test_secret",
+		http:       server.Client(),
+		apiBaseURL: server.URL,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+
+	_, err := client.CreateRefund(
+		ctx,
+		"pay_test123",
+		50000,
+		"trailnest-refund-123",
+		"internal-refund-123",
+	)
+	if err == nil {
+		t.Fatal("expected context timeout to return an error")
 	}
 }

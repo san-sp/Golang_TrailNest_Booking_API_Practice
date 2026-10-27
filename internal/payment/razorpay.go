@@ -464,3 +464,179 @@ func (c *RazorpayClient) FetchPayment(
 
 	return result, nil
 }
+
+type RazorpayRefund struct {
+	ID        string            `json:"id"`
+	PaymentID string            `json:"payment_id"`
+	Amount    int64             `json:"amount"`
+	Currency  string            `json:"currency"`
+	Status    string            `json:"status"`
+	Notes     map[string]string `json:"notes"`
+}
+
+type razorpayRefundRequest struct {
+	Amount int64             `json:"amount"`
+	Notes  map[string]string `json:"notes"`
+}
+
+func (c *RazorpayClient) CreateRefund(
+	ctx context.Context,
+	paymentID string,
+	amount int64,
+	idempotencyKey string,
+	internalRefundID string,
+) (RazorpayRefund, error) {
+	paymentID = strings.TrimSpace(paymentID)
+	idempotencyKey = strings.TrimSpace(idempotencyKey)
+	internalRefundID = strings.TrimSpace(internalRefundID)
+
+	if paymentID == "" || strings.Contains(paymentID, "/") {
+		return RazorpayRefund{}, errors.New("invalid Razorpay payment ID")
+	}
+
+	if amount <= 0 {
+		return RazorpayRefund{}, errors.New("refund amount must be positive")
+	}
+
+	if len(idempotencyKey) < 10 {
+		return RazorpayRefund{}, errors.New("refund idempotency key must contain at least 10 characters")
+	}
+
+	for _, ch := range idempotencyKey {
+		if !((ch >= 'a' && ch <= 'z') ||
+			(ch >= 'A' && ch <= 'Z') ||
+			(ch >= '0' && ch <= '9') ||
+			ch == '-' || ch == '_') {
+			return RazorpayRefund{}, errors.New("invalid refund idempotency key")
+		}
+	}
+
+	if internalRefundID == "" {
+		return RazorpayRefund{}, errors.New("internal refund ID is required")
+	}
+
+	payload, err := json.Marshal(razorpayRefundRequest{
+		Amount: amount,
+		Notes: map[string]string{
+			"trailnest_refund_id": internalRefundID,
+		},
+	})
+	if err != nil {
+		return RazorpayRefund{}, fmt.Errorf("encode Razorpay refund request: %w", err)
+	}
+
+	endpoint := strings.TrimRight(c.apiBaseURL, "/") +
+		"/v1/payments/" + paymentID + "/refund"
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		endpoint,
+		bytes.NewReader(payload),
+	)
+	if err != nil {
+		return RazorpayRefund{}, fmt.Errorf("build Razorpay refund request: %w", err)
+	}
+
+	req.SetBasicAuth(c.keyID, c.keySecret)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Refund-Idempotency", idempotencyKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return RazorpayRefund{}, fmt.Errorf("create Razorpay refund: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return RazorpayRefund{}, fmt.Errorf("read Razorpay refund response: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return RazorpayRefund{}, fmt.Errorf(
+			"Razorpay refund creation failed with HTTP status %d",
+			resp.StatusCode,
+		)
+	}
+
+	var result RazorpayRefund
+	if err := json.Unmarshal(body, &result); err != nil {
+		return RazorpayRefund{}, fmt.Errorf("decode Razorpay refund: %w", err)
+	}
+
+	if result.ID == "" ||
+		result.PaymentID != paymentID ||
+		result.Amount != amount {
+		return RazorpayRefund{}, errors.New("Razorpay refund response does not match the request")
+	}
+
+	if result.Status != "pending" &&
+		result.Status != "processed" &&
+		result.Status != "failed" {
+		return RazorpayRefund{}, errors.New("unexpected Razorpay refund status")
+	}
+
+	return result, nil
+}
+
+func (c *RazorpayClient) FetchRefund(
+	ctx context.Context,
+	refundID string,
+) (RazorpayRefund, error) {
+	refundID = strings.TrimSpace(refundID)
+
+	if refundID == "" || strings.Contains(refundID, "/") {
+		return RazorpayRefund{}, errors.New("invalid Razorpay refund ID")
+	}
+
+	endpoint := strings.TrimRight(c.apiBaseURL, "/") +
+		"/v1/refunds/" + refundID
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		endpoint,
+		nil,
+	)
+	if err != nil {
+		return RazorpayRefund{}, fmt.Errorf("build Razorpay refund lookup: %w", err)
+	}
+
+	req.SetBasicAuth(c.keyID, c.keySecret)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return RazorpayRefund{}, fmt.Errorf("fetch Razorpay refund: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return RazorpayRefund{}, fmt.Errorf("read Razorpay refund response: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return RazorpayRefund{}, fmt.Errorf(
+			"Razorpay refund lookup failed with HTTP status %d",
+			resp.StatusCode,
+		)
+	}
+
+	var result RazorpayRefund
+	if err := json.Unmarshal(body, &result); err != nil {
+		return RazorpayRefund{}, fmt.Errorf("decode Razorpay refund: %w", err)
+	}
+
+	if result.ID != refundID || result.PaymentID == "" {
+		return RazorpayRefund{}, errors.New("Razorpay refund lookup returned mismatched data")
+	}
+
+	if result.Status != "pending" &&
+		result.Status != "processed" &&
+		result.Status != "failed" {
+		return RazorpayRefund{}, errors.New("unexpected Razorpay refund status")
+	}
+
+	return result, nil
+}

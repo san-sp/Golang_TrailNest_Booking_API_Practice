@@ -37,15 +37,19 @@ func (r *Repository) ProcessSuccessfulWebhook(
 	var paymentID uuid.UUID
 	var reservationID uuid.UUID
 	var customerID uuid.UUID
+	var amountMinor int64
+	var currency string
 
 	err = tx.QueryRow(ctx, `
-		SELECT id, reservation_id, customer_id
-		FROM payments
-		WHERE provider = $1 AND provider_payment_id = $2
-	`, provider, providerPaymentID).Scan(
+        SELECT id, reservation_id, customer_id, amount_minor, currency
+        FROM payments
+        WHERE provider = $1 AND provider_payment_id = $2
+`, provider, providerPaymentID).Scan(
 		&paymentID,
 		&reservationID,
 		&customerID,
+		&amountMinor,
+		&currency,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrPaymentNotFound
@@ -245,14 +249,80 @@ func (r *Repository) ProcessSuccessfulWebhook(
 
 	if needsRefund {
 		_, err = tx.Exec(ctx, `
-			UPDATE payments
-			SET status = 'succeeded',
-			    fulfillment_status = 'refund_required',
-			    updated_at = NOW()
-			WHERE id = $1
-		`, paymentID)
+                UPDATE payments
+                SET status = 'succeeded',
+                    fulfillment_status = 'refund_required',
+                    updated_at = NOW()
+                WHERE id = $1
+        `, paymentID)
 		if err != nil {
 			return fmt.Errorf("record payment requiring refund: %w", err)
+		}
+
+		refundIdempotencyKey := "trailnest-refund-" + paymentID.String()
+
+		tag, err := tx.Exec(ctx, `
+    INSERT INTO payment_refunds (
+        payment_id,
+        provider,
+        provider_payment_id,
+        idempotency_key,
+        amount_minor,
+        currency,
+        status
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+    ON CONFLICT (payment_id) DO NOTHING
+`,
+			paymentID,
+			provider,
+			providerPaymentID,
+			refundIdempotencyKey,
+			amountMinor,
+			currency,
+		)
+		if err != nil {
+			return fmt.Errorf("create refund job: %w", err)
+		}
+
+		if tag.RowsAffected() == 0 {
+			var existingProvider string
+			var existingProviderPaymentID string
+			var existingIdempotencyKey string
+			var existingAmount int64
+			var existingCurrency string
+
+			err = tx.QueryRow(ctx, `
+        SELECT
+            provider,
+            provider_payment_id,
+            idempotency_key,
+            amount_minor,
+            currency
+        FROM payment_refunds
+        WHERE payment_id = $1
+        FOR UPDATE
+    `, paymentID).Scan(
+				&existingProvider,
+				&existingProviderPaymentID,
+				&existingIdempotencyKey,
+				&existingAmount,
+				&existingCurrency,
+			)
+			if err != nil {
+				return fmt.Errorf("verify existing refund job: %w", err)
+			}
+
+			if existingProvider != provider ||
+				existingProviderPaymentID != providerPaymentID ||
+				existingIdempotencyKey != refundIdempotencyKey ||
+				existingAmount != amountMinor ||
+				existingCurrency != currency {
+				return fmt.Errorf(
+					"existing refund job does not match payment %s",
+					paymentID,
+				)
+			}
 		}
 
 		_, err = tx.Exec(ctx, `
