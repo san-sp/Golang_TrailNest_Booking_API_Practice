@@ -28,6 +28,7 @@ type Activity struct {
 	RemainingCapacity int       `json:"remaining_capacity"`
 	PriceMinor        int64     `json:"price_minor"`
 	Currency          string    `json:"currency"`
+	ImageURL          *string   `json:"image_url"`
 }
 
 type Repository struct {
@@ -72,6 +73,7 @@ func (r *Repository) ListPublished(
 			a.created_at,
 			a.price_minor,
 			a.currency,
+			a.image_url,
 			a.capacity
 			- COALESCE((
 					SELECT SUM(b.quantity)
@@ -125,6 +127,7 @@ func (r *Repository) ListPublished(
 			&a.CreatedAt,
 			&a.PriceMinor,
 			&a.Currency,
+			&a.ImageURL,
 			&a.RemainingCapacity,
 		); err != nil {
 			return nil, fmt.Errorf("scan activity: %w", err)
@@ -160,6 +163,7 @@ func (r *Repository) GetPublishedByID(
 			a.created_at,
 			a.price_minor,
 			a.currency,
+			a.image_url,
 			a.capacity
 				- COALESCE((
 					SELECT SUM(b.quantity)
@@ -191,6 +195,7 @@ func (r *Repository) GetPublishedByID(
 		&a.CreatedAt,
 		&a.PriceMinor,
 		&a.Currency,
+		&a.ImageURL,
 		&a.RemainingCapacity,
 	)
 
@@ -220,7 +225,7 @@ func (r *Repository) Create(
 		RETURNING
 			id, owner_id, title, description, location,
 			starts_at, ends_at, capacity, status, created_at,
-			price_minor, currency, capacity
+			price_minor, currency, image_url, capacity
 	`,
 		input.OwnerID,
 		input.Title,
@@ -244,6 +249,7 @@ func (r *Repository) Create(
 		&a.CreatedAt,
 		&a.PriceMinor,
 		&a.Currency,
+		&a.ImageURL,
 		&a.RemainingCapacity,
 	)
 	if err != nil {
@@ -262,7 +268,7 @@ func (r *Repository) ListAdmin(
 		SELECT
 			a.id, a.owner_id, a.title, a.description, a.location,
 			a.starts_at, a.ends_at, a.capacity, a.status, a.created_at,
-			a.price_minor, a.currency,
+			a.price_minor, a.currency, a.image_url,
 			a.capacity
 				- COALESCE((
 					SELECT SUM(b.quantity)
@@ -302,6 +308,7 @@ func (r *Repository) ListAdmin(
 			&a.CreatedAt,
 			&a.PriceMinor,
 			&a.Currency,
+			&a.ImageURL,
 			&a.RemainingCapacity,
 		); err != nil {
 			return nil, fmt.Errorf("scan admin activity: %w", err)
@@ -326,7 +333,7 @@ func (r *Repository) ListByOwner(
 		SELECT
 			a.id, a.owner_id, a.title, a.description, a.location,
 			a.starts_at, a.ends_at, a.capacity, a.status, a.created_at,
-			a.price_minor, a.currency,
+			a.price_minor, a.currency, a.image_url,
 			a.capacity
 				- COALESCE((
 					SELECT SUM(b.quantity)
@@ -367,6 +374,7 @@ func (r *Repository) ListByOwner(
 			&a.CreatedAt,
 			&a.PriceMinor,
 			&a.Currency,
+			&a.ImageURL,
 			&a.RemainingCapacity,
 		); err != nil {
 			return nil, fmt.Errorf("scan operator activity: %w", err)
@@ -392,7 +400,7 @@ func (r *Repository) GetByOwner(
 		SELECT
 			a.id, a.owner_id, a.title, a.description, a.location,
 			a.starts_at, a.ends_at, a.capacity, a.status, a.created_at,
-			a.price_minor, a.currency,
+			a.price_minor, a.currency, a.image_url,
 			a.capacity
 				- COALESCE((
 					SELECT SUM(b.quantity)
@@ -422,6 +430,7 @@ func (r *Repository) GetByOwner(
 		&a.CreatedAt,
 		&a.PriceMinor,
 		&a.Currency,
+		&a.ImageURL,
 		&a.RemainingCapacity,
 	)
 
@@ -430,6 +439,66 @@ func (r *Repository) GetByOwner(
 	}
 	if err != nil {
 		return Activity{}, fmt.Errorf("get operator activity: %w", err)
+	}
+
+	return a, nil
+}
+
+func (r *Repository) UpdateImageURLByOwner(
+	ctx context.Context,
+	ownerID uuid.UUID,
+	id uuid.UUID,
+	imageURL string,
+) (Activity, error) {
+	var a Activity
+
+	err := r.pool.QueryRow(ctx, `
+        UPDATE activities
+        SET image_url = $3,
+            updated_at = NOW()
+        WHERE id = $1
+          AND owner_id = $2
+          AND status <> 'cancelled'
+        RETURNING
+            id, owner_id, title, description, location,
+            starts_at, ends_at, capacity, status, created_at,
+            price_minor, currency, image_url,
+            capacity
+                - COALESCE((
+                    SELECT SUM(b.quantity)
+                    FROM bookings b
+                    WHERE b.activity_id = activities.id
+                      AND b.status = 'confirmed'
+                ), 0)::INTEGER
+                - COALESCE((
+                    SELECT SUM(res.quantity)
+                    FROM reservations res
+                    WHERE res.activity_id = activities.id
+                      AND res.status = 'pending'
+                      AND res.expires_at > NOW()
+                ), 0)::INTEGER AS remaining_capacity
+    `, id, ownerID, imageURL).Scan(
+		&a.ID,
+		&a.OwnerID,
+		&a.Title,
+		&a.Description,
+		&a.Location,
+		&a.StartsAt,
+		&a.EndsAt,
+		&a.Capacity,
+		&a.Status,
+		&a.CreatedAt,
+		&a.PriceMinor,
+		&a.Currency,
+		&a.ImageURL,
+		&a.RemainingCapacity,
+	)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Activity{}, ErrActivityNotFound
+	}
+	if err != nil {
+		return Activity{}, fmt.Errorf("update activity image: %w", err)
 	}
 
 	return a, nil
@@ -445,7 +514,7 @@ func (r *Repository) GetAdminByID(
 		SELECT
 			a.id, a.owner_id, a.title, a.description, a.location,
 			a.starts_at, a.ends_at, a.capacity, a.status, a.created_at,
-			a.price_minor, a.currency,
+			a.price_minor, a.currency, a.image_url,
 			a.capacity
 				- COALESCE((
 					SELECT SUM(b.quantity)
@@ -475,6 +544,7 @@ func (r *Repository) GetAdminByID(
 		&a.CreatedAt,
 		&a.PriceMinor,
 		&a.Currency,
+		&a.ImageURL,
 		&a.RemainingCapacity,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -602,8 +672,8 @@ func (r *Repository) updateDetails(
 		RETURNING
 		    id, owner_id, title, description, location,
 		    starts_at, ends_at, capacity, status, created_at,
-		    price_minor, currency,
-		    capacity - $10::INTEGER - $11::INTEGER
+		    price_minor, currency, image_url,
+				capacity - $10::INTEGER - $11::INTEGER
 	`,
 		id,
 		input.Title,
@@ -629,6 +699,7 @@ func (r *Repository) updateDetails(
 		&a.CreatedAt,
 		&a.PriceMinor,
 		&a.Currency,
+		&a.ImageURL,
 		&a.RemainingCapacity,
 	)
 	if err != nil {
@@ -714,7 +785,7 @@ func (r *Repository) changeStatus(
 		RETURNING
 		    id, owner_id, title, description, location,
 		    starts_at, ends_at, capacity, status, created_at,
-		    price_minor, currency,
+		    price_minor, currency, image_url,
 		    capacity
 		      - COALESCE((
 		          SELECT SUM(b.quantity)
@@ -742,6 +813,7 @@ func (r *Repository) changeStatus(
 		&a.CreatedAt,
 		&a.PriceMinor,
 		&a.Currency,
+		&a.ImageURL,
 		&a.RemainingCapacity,
 	)
 	if err != nil {

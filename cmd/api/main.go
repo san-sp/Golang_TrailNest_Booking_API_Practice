@@ -19,6 +19,7 @@ import (
 	"trailnest/internal/http/middleware"
 	"trailnest/internal/payment"
 	"trailnest/internal/reservation"
+	"trailnest/internal/storage"
 	"trailnest/internal/user"
 	"trailnest/internal/wishlist"
 
@@ -76,6 +77,11 @@ func main() {
 		},
 	}))
 
+	router.Static(
+		cfg.ImageStoragePublicURL,
+		cfg.ImageStorageDirectory,
+	)
+
 	// Assign the request ID before logging and handling the request.
 	router.Use(
 		middleware.RequestID(),
@@ -126,7 +132,20 @@ func main() {
 	wishlistHandler := wishlist.NewHandler(wishlistRepository)
 
 	activityRepository := activity.NewRepository(pool)
-	activityHandler := activity.NewHandler(activityRepository)
+
+	imageStorage, err := storage.NewLocalImageStorage(
+		cfg.ImageStorageDirectory,
+		cfg.ImageStoragePublicURL,
+	)
+	if err != nil {
+		slog.Error("initialize image storage", "error", err)
+		os.Exit(1)
+	}
+
+	activityHandler := activity.NewHandlerWithImageStorage(
+		activityRepository,
+		imageStorage,
+	)
 
 	reservationRepository := reservation.NewRepository(pool)
 	reservationHandler := reservation.NewHandler(reservationRepository)
@@ -180,6 +199,10 @@ func main() {
 	operator.POST("/activities", activityHandler.OperatorCreate)
 	operator.GET("/activities", activityHandler.OperatorList)
 	operator.GET("/activities/:activityID", activityHandler.OperatorGetByID)
+	operator.POST(
+		"/activities/:activityID/image",
+		activityHandler.OperatorUploadImage,
+	)
 	operator.PATCH("/activities/:activityID", activityHandler.OperatorUpdate)
 	operator.PATCH(
 		"/activities/:activityID/status",

@@ -3,6 +3,7 @@ module trailnest
 go 1.27.1
 
 require (
+	github.com/KarpelesLab/gowebp v0.1.1
 	github.com/gin-contrib/cors v1.7.9
 	github.com/gin-gonic/gin v1.12.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
@@ -11,6 +12,7 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/stretchr/testify v1.12.1
 	golang.org/x/crypto v0.58.0
+	golang.org/x/image v0.24.0
 	golang.org/x/term v0.47.0
 )
 

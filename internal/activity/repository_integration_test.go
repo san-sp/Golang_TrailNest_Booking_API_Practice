@@ -374,3 +374,80 @@ func TestGetPublishedByIDVisibility(t *testing.T) {
 		require.ErrorIs(t, err, ErrActivityNotFound)
 	})
 }
+
+func TestUpdateImageURLByOwner(t *testing.T) {
+	pool := openActivityTestPool(t)
+	ctx := t.Context()
+
+	ownerID := uuid.New()
+	otherOwnerID := uuid.New()
+	activityID := uuid.New()
+
+	for _, user := range []struct {
+		id    uuid.UUID
+		email string
+	}{
+		{ownerID, uuid.NewString() + "@example.test"},
+		{otherOwnerID, uuid.NewString() + "@example.test"},
+	} {
+		_, err := pool.Exec(ctx, `
+			INSERT INTO users (id, email, password_hash, role, email_verified)
+			VALUES ($1, $2, 'test-hash', 'operator', TRUE)
+		`, user.id, user.email)
+		require.NoError(t, err)
+	}
+
+	_, err := pool.Exec(ctx, `
+		INSERT INTO activities (
+			id, owner_id, title, description, location,
+			starts_at, ends_at, capacity, status, price_minor, currency
+		)
+		VALUES (
+			$1, $2, 'Image test activity', 'Test description',
+			'Test location', NOW() + INTERVAL '2 days',
+			NOW() + INTERVAL '3 days', 10, 'published', 2500, 'INR'
+		)
+	`, activityID, ownerID)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		_, err := pool.Exec(context.Background(),
+			`DELETE FROM activities WHERE id = $1`, activityID)
+		if err != nil {
+			t.Errorf("cleanup activity: %v", err)
+		}
+
+		_, err = pool.Exec(context.Background(),
+			`DELETE FROM users WHERE id = ANY($1)`, []uuid.UUID{ownerID, otherOwnerID})
+		if err != nil {
+			t.Errorf("cleanup users: %v", err)
+		}
+	})
+
+	repo := NewRepository(pool)
+	imageURL := "/uploads/activities/test-image.jpg"
+
+	// The owner can update the activity's image URL.
+	updated, err := repo.UpdateImageURLByOwner(ctx, ownerID, activityID, imageURL)
+	require.NoError(t, err)
+	require.NotNil(t, updated.ImageURL)
+	require.Equal(t, imageURL, *updated.ImageURL)
+
+	// Another operator cannot overwrite the image URL.
+	_, err = repo.UpdateImageURLByOwner(
+		ctx, otherOwnerID, activityID, "/uploads/activities/unauthorized.jpg",
+	)
+	require.ErrorIs(t, err, ErrActivityNotFound)
+
+	// The original image URL remains unchanged.
+	current, err := repo.GetByOwner(ctx, ownerID, activityID)
+	require.NoError(t, err)
+	require.NotNil(t, current.ImageURL)
+	require.Equal(t, imageURL, *current.ImageURL)
+
+	// A nonexistent activity is reported as not found.
+	_, err = repo.UpdateImageURLByOwner(
+		ctx, ownerID, uuid.New(), "/uploads/activities/missing.jpg",
+	)
+	require.ErrorIs(t, err, ErrActivityNotFound)
+}

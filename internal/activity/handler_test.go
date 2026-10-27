@@ -1,6 +1,8 @@
 package activity
 
 import (
+	"context"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -95,4 +97,33 @@ func TestListRejectsInvalidLimit(t *testing.T) {
 			require.Contains(t, recorder.Body.String(), "INVALID_LIMIT")
 		})
 	}
+}
+
+type fakeImageStorage struct {
+	saveURL    string
+	saveErr    error
+	deleteErr  error
+	saveCalls  int
+	deleteURLs []string
+}
+
+func (f *fakeImageStorage) Save(
+	ctx context.Context,
+	file multipart.File,
+) (string, error) {
+	f.saveCalls++
+
+	if f.saveErr != nil {
+		return "", f.saveErr
+	}
+
+	return f.saveURL, nil
+}
+
+func (f *fakeImageStorage) Delete(
+	ctx context.Context,
+	imageURL string,
+) error {
+	f.deleteURLs = append(f.deleteURLs, imageURL)
+	return f.deleteErr
 }

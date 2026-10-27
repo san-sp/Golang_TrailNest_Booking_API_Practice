@@ -18,6 +18,8 @@ type Config struct {
 	RazorpayKeyID         string
 	RazorpayKeySecret     string
 	RazorpayWebhookSecret string
+	ImageStorageDirectory string
+	ImageStoragePublicURL string
 }
 
 func Load() (Config, error) {
@@ -61,6 +63,21 @@ func Load() (Config, error) {
 	razorpayKeySecret := strings.TrimSpace(os.Getenv("RAZORPAY_KEY_SECRET"))
 	razorpayWebhookSecret := strings.TrimSpace(os.Getenv("RAZORPAY_WEBHOOK_SECRET"))
 
+	imageStorageDirectory := strings.TrimSpace(
+		os.Getenv("IMAGE_STORAGE_DIRECTORY"),
+	)
+	if imageStorageDirectory == "" {
+		imageStorageDirectory = "uploads/activities"
+	}
+
+	imageStoragePublicURL := strings.TrimRight(
+		strings.TrimSpace(os.Getenv("IMAGE_STORAGE_PUBLIC_URL")),
+		"/",
+	)
+	if imageStoragePublicURL == "" {
+		imageStoragePublicURL = "/uploads/activities"
+	}
+
 	return Config{
 		Port:                  port,
 		DatabaseURL:           strings.TrimSpace(os.Getenv("DATABASE_URL")),
@@ -72,5 +89,7 @@ func Load() (Config, error) {
 		RazorpayKeyID:         razorpayKeyID,
 		RazorpayKeySecret:     razorpayKeySecret,
 		RazorpayWebhookSecret: razorpayWebhookSecret,
+		ImageStorageDirectory: imageStorageDirectory,
+		ImageStoragePublicURL: imageStoragePublicURL,
 	}, nil
 }

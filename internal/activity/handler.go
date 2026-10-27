@@ -1,8 +1,10 @@
 package activity
 
 import (
+	"context"
 	"errors"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
 	"strconv"
 	"strings"
@@ -14,12 +16,60 @@ import (
 	"trailnest/internal/http/response"
 )
 
+type ImageStorage interface {
+	Save(ctx context.Context, file multipart.File) (string, error)
+	Delete(ctx context.Context, imageURL string) error
+}
+
+type ActivityImageRepository interface {
+	GetByOwner(
+		ctx context.Context,
+		ownerID uuid.UUID,
+		id uuid.UUID,
+	) (Activity, error)
+
+	UpdateImageURLByOwner(
+		ctx context.Context,
+		ownerID uuid.UUID,
+		id uuid.UUID,
+		imageURL string,
+	) (Activity, error)
+}
+
 type Handler struct {
-	activities *Repository
+	activities      *Repository
+	imageActivities ActivityImageRepository
+	images          ImageStorage
 }
 
 func NewHandler(activities *Repository) *Handler {
-	return &Handler{activities: activities}
+	return &Handler{
+		activities:      activities,
+		imageActivities: activities,
+	}
+}
+
+func NewHandlerWithImageStorage(
+	activities *Repository,
+	images ImageStorage,
+) *Handler {
+	return &Handler{
+		activities:      activities,
+		imageActivities: activities,
+		images:          images,
+	}
+}
+
+func NewHandlerWithImageDependencies(
+	activities *Repository,
+	imageActivities ActivityImageRepository,
+	images ImageStorage,
+) *Handler {
+	return &Handler{
+		activities:      activities,
+		imageActivities: imageActivities,
+		images:          images,
+	}
 }
 
 func (h *Handler) List(c *gin.Context) {

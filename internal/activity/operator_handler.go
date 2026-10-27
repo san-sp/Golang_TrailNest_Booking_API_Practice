@@ -1,6 +1,7 @@
 package activity
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -317,4 +318,182 @@ func (h *Handler) OperatorChangeStatus(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"data": item})
+}
+
+func (h *Handler) OperatorUploadImage(c *gin.Context) {
+	if h.images == nil {
+		response.Error(
+			c,
+			http.StatusServiceUnavailable,
+			"IMAGE_STORAGE_UNAVAILABLE",
+			"Image uploads are currently unavailable.",
+			nil,
+		)
+		return
+	}
+
+	operatorID, ok := authenticatedOperatorID(c)
+	if !ok {
+		return
+	}
+
+	activityID, err := uuid.Parse(c.Param("activityID"))
+	if err != nil {
+		response.Error(
+			c,
+			http.StatusBadRequest,
+			"INVALID_ACTIVITY_ID",
+			"Activity ID must be a valid UUID.",
+			nil,
+		)
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// Verify ownership before accepting or saving the image.
+	existing, err := h.imageActivities.GetByOwner(ctx, operatorID, activityID)
+	if err != nil {
+		if errors.Is(err, ErrActivityNotFound) {
+			response.Error(
+				c,
+				http.StatusNotFound,
+				"ACTIVITY_NOT_FOUND",
+				"Activity not found.",
+				nil,
+			)
+			return
+		}
+
+		slog.Error("operator image upload ownership check failed", "error", err)
+		response.Internal(c)
+		return
+	}
+
+	// Limit the entire multipart request, including its boundaries and headers.
+	c.Request.Body = http.MaxBytesReader(
+		c.Writer,
+		c.Request.Body,
+		6<<20,
+	)
+
+	file, header, err := c.Request.FormFile("image")
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			response.Error(
+				c,
+				http.StatusRequestEntityTooLarge,
+				"IMAGE_TOO_LARGE",
+				"Image upload must not exceed 5 MiB.",
+				nil,
+			)
+			return
+		}
+
+		response.Error(
+			c,
+			http.StatusBadRequest,
+			"INVALID_IMAGE_UPLOAD",
+			"Provide an image using the multipart field named image.",
+			nil,
+		)
+		return
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			slog.Warn("close uploaded image", "error", err)
+		}
+	}()
+
+	// Reject a file whose declared size already exceeds the limit.
+	// Storage independently validates the actual bytes and image format.
+	if header.Size > 5<<20 {
+		response.Error(
+			c,
+			http.StatusRequestEntityTooLarge,
+			"IMAGE_TOO_LARGE",
+			"Image upload must not exceed 5 MiB.",
+			nil,
+		)
+		return
+	}
+
+	imageURL, err := h.images.Save(ctx, file)
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			response.Error(
+				c,
+				http.StatusRequestEntityTooLarge,
+				"IMAGE_TOO_LARGE",
+				"Image upload must not exceed 5 MiB.",
+				nil,
+			)
+			return
+		}
+
+		if errors.Is(err, context.Canceled) ||
+			errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
+
+		slog.Warn("operator image upload rejected", "error", err)
+		response.Error(
+			c,
+			http.StatusBadRequest,
+			"INVALID_IMAGE",
+			"Image must be a valid JPEG or PNG within the permitted size and dimensions.",
+			nil,
+		)
+		return
+	}
+
+	updated, err := h.imageActivities.UpdateImageURLByOwner(
+		ctx,
+		operatorID,
+		activityID,
+		imageURL,
+	)
+	if err != nil {
+		if cleanupErr := h.images.Delete(context.Background(), imageURL); cleanupErr != nil {
+			slog.Error("cleanup uploaded image failed", "error", cleanupErr)
+		}
+
+		if errors.Is(err, ErrActivityNotFound) {
+			response.Error(
+				c,
+				http.StatusNotFound,
+				"ACTIVITY_NOT_FOUND",
+				"Activity not found.",
+				nil,
+			)
+			return
+		}
+
+		slog.Error("save activity image URL failed", "error", err)
+		response.Internal(c)
+		return
+	}
+
+	// Delete the previous image only after the database update succeeds.
+	// Use a separate timeout so a disconnected client doesn't cancel cleanup.
+	if existing.ImageURL != nil && *existing.ImageURL != imageURL {
+		cleanupCtx, cancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+
+		err := h.images.Delete(cleanupCtx, *existing.ImageURL)
+		cancel()
+
+		if err != nil {
+			slog.Warn(
+				"delete previous activity image failed",
+				"error", err,
+			)
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"data": updated})
 }
