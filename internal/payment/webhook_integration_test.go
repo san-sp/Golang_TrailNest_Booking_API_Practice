@@ -597,6 +597,59 @@ func TestRecordPaymentAttemptRejectsConflictingProviderPaymentID(t *testing.T) {
 	require.Equal(t, "failed", storedStatus)
 }
 
+func TestAssociateProviderPaymentRejectsConflictingProviderPaymentID(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+
+	f := createWebhookFixture(t, pool)
+	repo := NewRepository(pool)
+
+	orderID := "order_" + uuid.NewString()
+	firstProviderPaymentID := "pay_" + uuid.NewString()
+	secondProviderPaymentID := "pay_" + uuid.NewString()
+
+	_, err := pool.Exec(ctx, `
+		UPDATE payments
+		SET provider = 'razorpay',
+		    provider_payment_id = NULL,
+		    provider_order_id = $2
+		WHERE id = $1
+	`, f.paymentID, orderID)
+	require.NoError(t, err)
+
+	// Associate the first provider payment ID.
+	err = repo.AssociateProviderPayment(
+		ctx,
+		f.paymentID,
+		orderID,
+		firstProviderPaymentID,
+		5000,
+		"INR",
+	)
+	require.NoError(t, err)
+
+	// A different provider payment ID must not replace the original.
+	err = repo.AssociateProviderPayment(
+		ctx,
+		f.paymentID,
+		orderID,
+		secondProviderPaymentID,
+		5000,
+		"INR",
+	)
+	require.ErrorIs(t, err, ErrIdempotencyConflict)
+
+	// Verify that the original association remains unchanged.
+	var storedProviderPaymentID string
+	err = pool.QueryRow(ctx, `
+		SELECT provider_payment_id
+		FROM payments
+		WHERE id = $1
+	`, f.paymentID).Scan(&storedProviderPaymentID)
+	require.NoError(t, err)
+	require.Equal(t, firstProviderPaymentID, storedProviderPaymentID)
+}
+
 func TestRecordPaymentLinkAttempt(t *testing.T) {
 	pool := openTestPool(t)
 	ctx := context.Background()
