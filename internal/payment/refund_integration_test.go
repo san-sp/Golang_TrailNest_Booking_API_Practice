@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -14,15 +15,16 @@ import (
 )
 
 type fakeRefundProvider struct {
-	refund        RazorpayRefund
-	err           error
-	calls         int
-	fetchedRefund RazorpayRefund
-	fetchErr      error
-	fetchCalls    int
-	listedRefunds []RazorpayRefund
-	listErr       error
-	listCalls     int
+	refund              RazorpayRefund
+	err                 error
+	calls               int
+	fetchedRefund       RazorpayRefund
+	fetchErr            error
+	fetchCalls          int
+	listedRefunds       []RazorpayRefund
+	listErr             error
+	listCalls           int
+	listErrorsByPayment map[string]error
 }
 
 func (f *fakeRefundProvider) ListPaymentRefunds(
@@ -32,9 +34,15 @@ func (f *fakeRefundProvider) ListPaymentRefunds(
 	skip int,
 ) ([]RazorpayRefund, error) {
 	f.listCalls++
+
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
+
+	if err := f.listErrorsByPayment[paymentID]; err != nil {
+		return nil, err
+	}
+
 	if skip >= len(f.listedRefunds) {
 		return []RazorpayRefund{}, nil
 	}
@@ -265,6 +273,156 @@ func prepareRefundCompletionFixture(
 	})
 
 	return f, refundID
+}
+
+func TestListStaleRefundJobs(t *testing.T) {
+	pool := openTestPool(t)
+	repo := NewRepository(pool)
+
+	_, staleID := prepareRefundCompletionFixture(t, pool, "processing")
+	_, recentID := prepareRefundCompletionFixture(t, pool, "processing")
+	_, pendingID := prepareRefundCompletionFixture(t, pool, "pending")
+
+	// Make one processing job old enough to be considered stale.
+	_, err := pool.Exec(context.Background(), `
+		UPDATE payment_refunds
+		SET claimed_at = NOW() - INTERVAL '1 hour'
+		WHERE id = $1
+	`, staleID)
+	require.NoError(t, err)
+
+	// Ensure the other processing job is recent.
+	_, err = pool.Exec(context.Background(), `
+		UPDATE payment_refunds
+		SET claimed_at = NOW()
+		WHERE id = $1
+	`, recentID)
+	require.NoError(t, err)
+
+	// A pending job must not be returned, regardless of its age.
+	_, err = pool.Exec(context.Background(), `
+		UPDATE payment_refunds
+		SET claimed_at = NOW() - INTERVAL '1 hour'
+		WHERE id = $1
+	`, pendingID)
+	require.NoError(t, err)
+
+	jobs, err := repo.ListStaleRefundJobs(
+		context.Background(),
+		30*time.Minute,
+		100,
+	)
+
+	require.NoError(t, err)
+
+	var foundStale, foundRecent, foundPending bool
+	for _, job := range jobs {
+		switch job.ID {
+		case staleID:
+			foundStale = true
+		case recentID:
+			foundRecent = true
+		case pendingID:
+			foundPending = true
+		}
+	}
+
+	require.True(t, foundStale, "old processing job should be returned")
+	require.False(t, foundRecent, "recent processing job should be excluded")
+	require.False(t, foundPending, "pending job should be excluded")
+}
+
+func TestMarkRefundRecoveredForReview(t *testing.T) {
+	pool := openTestPool(t)
+	repo := NewRepository(pool)
+
+	f, refundID := prepareRefundCompletionFixture(t, pool, "processing")
+	providerRefundID := "rfnd_" + uuid.NewString()
+
+	err := repo.MarkRefundRecoveredForReview(
+		context.Background(),
+		refundID,
+		providerRefundID,
+		"recovered after worker restart",
+	)
+	require.NoError(t, err)
+
+	var status, storedProviderRefundID string
+	err = pool.QueryRow(context.Background(), `
+		SELECT status, provider_refund_id
+		FROM payment_refunds
+		WHERE id = $1
+	`, refundID).Scan(&status, &storedProviderRefundID)
+	require.NoError(t, err)
+	require.Equal(t, "review_required", status)
+	require.Equal(t, providerRefundID, storedProviderRefundID)
+
+	var paymentStatus, fulfillmentStatus string
+	err = pool.QueryRow(context.Background(), `
+		SELECT status, fulfillment_status
+		FROM payments
+		WHERE id = $1
+	`, f.paymentID).Scan(&paymentStatus, &fulfillmentStatus)
+	require.NoError(t, err)
+	require.Equal(t, "succeeded", paymentStatus)
+	require.Equal(t, "refund_required", fulfillmentStatus)
+}
+
+func TestMarkRefundRecoveredForReviewRejectsConflictingID(t *testing.T) {
+	pool := openTestPool(t)
+	repo := NewRepository(pool)
+
+	_, refundID := prepareRefundCompletionFixture(t, pool, "processing")
+	existingID := "rfnd_existing_" + uuid.NewString()
+
+	_, err := pool.Exec(context.Background(), `
+		UPDATE payment_refunds
+		SET provider_refund_id = $2
+		WHERE id = $1
+	`, refundID, existingID)
+	require.NoError(t, err)
+
+	err = repo.MarkRefundRecoveredForReview(
+		context.Background(),
+		refundID,
+		"rfnd_different_"+uuid.NewString(),
+		"recovered after worker restart",
+	)
+	require.Error(t, err)
+
+	var status, storedProviderRefundID string
+	err = pool.QueryRow(context.Background(), `
+		SELECT status, provider_refund_id
+		FROM payment_refunds
+		WHERE id = $1
+	`, refundID).Scan(&status, &storedProviderRefundID)
+	require.NoError(t, err)
+	require.Equal(t, "processing", status)
+	require.Equal(t, existingID, storedProviderRefundID)
+}
+
+func TestMarkRefundRecoveredForReviewRejectsWrongStatus(t *testing.T) {
+	pool := openTestPool(t)
+	repo := NewRepository(pool)
+
+	_, refundID := prepareRefundCompletionFixture(t, pool, "pending")
+
+	err := repo.MarkRefundRecoveredForReview(
+		context.Background(),
+		refundID,
+		"rfnd_"+uuid.NewString(),
+		"recovered after worker restart",
+	)
+	require.Error(t, err)
+
+	var status string
+	err = pool.QueryRow(context.Background(), `
+		SELECT status
+		FROM payment_refunds
+		WHERE id = $1
+	`, refundID).Scan(&status)
+	require.NoError(t, err)
+	require.Equal(t, "pending", status)
 }
 
 func TestMarkRefundSucceeded(t *testing.T) {
@@ -882,4 +1040,450 @@ func TestRefundWorkerRejectsReconciliationAmountMismatch(t *testing.T) {
 	`, f.paymentID).Scan(&fulfillmentStatus)
 	require.NoError(t, err)
 	require.Equal(t, "refund_required", fulfillmentStatus)
+}
+
+func TestRecoverStaleRefundsMatchesProviderRefund(t *testing.T) {
+	pool := openTestPool(t)
+	repo := NewRepository(pool)
+
+	f, refundID := prepareRefundCompletionFixture(t, pool, "processing")
+
+	_, err := pool.Exec(context.Background(), `
+		UPDATE payment_refunds
+		SET provider = 'razorpay',
+		    claimed_at = NOW() - INTERVAL '1 hour'
+		WHERE id = $1
+	`, refundID)
+	require.NoError(t, err)
+
+	providerRefundID := "rfnd_recovered_test"
+	provider := &fakeRefundProvider{
+		listedRefunds: []RazorpayRefund{
+			{
+				ID:        providerRefundID,
+				PaymentID: f.providerPaymentID,
+				Amount:    5000,
+				Currency:  "INR",
+				Status:    "processed",
+				Notes: map[string]string{
+					"trailnest_refund_id": refundID.String(),
+				},
+			},
+		},
+	}
+
+	worker := NewRefundWorker(repo, provider)
+
+	err = worker.RecoverStaleRefunds(
+		context.Background(),
+		30*time.Minute,
+		100,
+	)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, provider.listCalls, 1)
+
+	var status string
+	var storedProviderRefundID string
+	err = pool.QueryRow(context.Background(), `
+		SELECT status, provider_refund_id
+		FROM payment_refunds
+		WHERE id = $1
+	`, refundID).Scan(&status, &storedProviderRefundID)
+	require.NoError(t, err)
+
+	require.Equal(t, "review_required", status)
+	require.Equal(t, providerRefundID, storedProviderRefundID)
+}
+
+func TestRecoverStaleRefundsLeavesUnmatchedJobProcessing(t *testing.T) {
+	pool := openTestPool(t)
+	repo := NewRepository(pool)
+
+	f, refundID := prepareRefundCompletionFixture(t, pool, "processing")
+
+	_, err := pool.Exec(context.Background(), `
+		UPDATE payment_refunds
+		SET provider = 'razorpay',
+		    claimed_at = NOW() - INTERVAL '1 hour'
+		WHERE id = $1
+	`, refundID)
+	require.NoError(t, err)
+
+	provider := &fakeRefundProvider{
+		listedRefunds: []RazorpayRefund{
+			{
+				ID:        "rfnd_unrelated",
+				PaymentID: f.providerPaymentID,
+				Amount:    5000,
+				Currency:  "INR",
+				Status:    "processed",
+				Notes: map[string]string{
+					"trailnest_refund_id": uuid.NewString(),
+				},
+			},
+		},
+	}
+
+	worker := NewRefundWorker(repo, provider)
+
+	err = worker.RecoverStaleRefunds(
+		context.Background(),
+		30*time.Minute,
+		100,
+	)
+	require.NoError(t, err)
+
+	var status string
+	var providerRefundID *string
+	err = pool.QueryRow(context.Background(), `
+		SELECT status, provider_refund_id
+		FROM payment_refunds
+		WHERE id = $1
+	`, refundID).Scan(&status, &providerRefundID)
+	require.NoError(t, err)
+
+	require.Equal(t, "processing", status)
+	require.Nil(t, providerRefundID)
+}
+
+func TestRecoverStaleRefundsRejectsMultipleMatches(t *testing.T) {
+	pool := openTestPool(t)
+	repo := NewRepository(pool)
+
+	f, refundID := prepareRefundCompletionFixture(t, pool, "processing")
+
+	_, err := pool.Exec(context.Background(), `
+		UPDATE payment_refunds
+		SET provider = 'razorpay',
+		    claimed_at = NOW() - INTERVAL '1 hour'
+		WHERE id = $1
+	`, refundID)
+	require.NoError(t, err)
+
+	matchingNotes := map[string]string{
+		"trailnest_refund_id": refundID.String(),
+	}
+
+	provider := &fakeRefundProvider{
+		listedRefunds: []RazorpayRefund{
+			{
+				ID:        "rfnd_match_one",
+				PaymentID: f.providerPaymentID,
+				Amount:    5000,
+				Currency:  "INR",
+				Status:    "processed",
+				Notes:     matchingNotes,
+			},
+			{
+				ID:        "rfnd_match_two",
+				PaymentID: f.providerPaymentID,
+				Amount:    5000,
+				Currency:  "INR",
+				Status:    "processed",
+				Notes:     matchingNotes,
+			},
+		},
+	}
+
+	worker := NewRefundWorker(repo, provider)
+
+	err = worker.RecoverStaleRefunds(
+		context.Background(),
+		30*time.Minute,
+		100,
+	)
+	require.ErrorContains(t, err, "multiple provider refunds match")
+
+	var status string
+	var providerRefundID *string
+	err = pool.QueryRow(context.Background(), `
+		SELECT status, provider_refund_id
+		FROM payment_refunds
+		WHERE id = $1
+	`, refundID).Scan(&status, &providerRefundID)
+	require.NoError(t, err)
+
+	require.Equal(t, "processing", status)
+	require.Nil(t, providerRefundID)
+}
+
+func TestMarkRefundRecoveredForReviewIsIdempotent(t *testing.T) {
+	pool := openTestPool(t)
+	repo := NewRepository(pool)
+
+	_, refundID := prepareRefundCompletionFixture(t, pool, "processing")
+	providerRefundID := "rfnd_idempotent_test"
+
+	err := repo.MarkRefundRecoveredForReview(
+		context.Background(),
+		refundID,
+		providerRefundID,
+		"recovered after worker interruption",
+	)
+	require.NoError(t, err)
+
+	err = repo.MarkRefundRecoveredForReview(
+		context.Background(),
+		refundID,
+		providerRefundID,
+		"recovered after worker interruption",
+	)
+	require.NoError(t, err)
+
+	var status string
+	var storedProviderRefundID string
+	err = pool.QueryRow(context.Background(), `
+		SELECT status, provider_refund_id
+		FROM payment_refunds
+		WHERE id = $1
+	`, refundID).Scan(&status, &storedProviderRefundID)
+	require.NoError(t, err)
+
+	require.Equal(t, "review_required", status)
+	require.Equal(t, providerRefundID, storedProviderRefundID)
+}
+
+func TestMarkRefundRecoveredForReviewRejectsSecondProviderRefundID(
+	t *testing.T,
+) {
+	pool := openTestPool(t)
+	repo := NewRepository(pool)
+
+	_, refundID := prepareRefundCompletionFixture(t, pool, "processing")
+
+	err := repo.MarkRefundRecoveredForReview(
+		context.Background(),
+		refundID,
+		"rfnd_original",
+		"recovered after worker interruption",
+	)
+	require.NoError(t, err)
+
+	err = repo.MarkRefundRecoveredForReview(
+		context.Background(),
+		refundID,
+		"rfnd_conflicting",
+		"recovered after worker interruption",
+	)
+	require.Error(t, err)
+
+	var status string
+	var storedProviderRefundID string
+	err = pool.QueryRow(context.Background(), `
+		SELECT status, provider_refund_id
+		FROM payment_refunds
+		WHERE id = $1
+	`, refundID).Scan(&status, &storedProviderRefundID)
+	require.NoError(t, err)
+
+	require.Equal(t, "review_required", status)
+	require.Equal(t, "rfnd_original", storedProviderRefundID)
+}
+
+func TestRecoverStaleRefundsStopsAtPaginationLimit(t *testing.T) {
+	pool := openTestPool(t)
+	repo := NewRepository(pool)
+
+	f, refundID := prepareRefundCompletionFixture(t, pool, "processing")
+
+	_, err := pool.Exec(context.Background(), `
+		UPDATE payment_refunds
+		SET provider = 'razorpay',
+		    claimed_at = NOW() - INTERVAL '1 hour'
+		WHERE id = $1
+	`, refundID)
+	require.NoError(t, err)
+
+	provider := &fullPageRefundProvider{
+		callsByPayment: make(map[string]int),
+	}
+	worker := NewRefundWorker(repo, provider)
+
+	err = worker.RecoverStaleRefunds(
+		context.Background(),
+		30*time.Minute,
+		100,
+	)
+	require.ErrorContains(t, err, "refund listing exceeded 10 pages")
+	require.Equal(t, 10, provider.callsByPayment[f.providerPaymentID])
+
+	var status string
+	var storedProviderRefundID *string
+	err = pool.QueryRow(context.Background(), `
+		SELECT status, provider_refund_id
+		FROM payment_refunds
+		WHERE id = $1
+	`, refundID).Scan(&status, &storedProviderRefundID)
+	require.NoError(t, err)
+
+	require.Equal(t, "processing", status)
+	require.Nil(t, storedProviderRefundID)
+
+	_ = f // The fixture also creates the associated payment.
+}
+
+type fullPageRefundProvider struct {
+	calls          int
+	callsByPayment map[string]int
+}
+
+func (p *fullPageRefundProvider) CreateRefund(
+	ctx context.Context,
+	paymentID string,
+	amount int64,
+	idempotencyKey string,
+	internalRefundID string,
+) (RazorpayRefund, error) {
+	return RazorpayRefund{}, errors.New("unexpected CreateRefund call")
+}
+
+func (p *fullPageRefundProvider) ListPaymentRefunds(
+	ctx context.Context,
+	paymentID string,
+	count int,
+	skip int,
+) ([]RazorpayRefund, error) {
+	p.calls++
+	p.callsByPayment[paymentID]++
+
+	refunds := make([]RazorpayRefund, count)
+	for i := range refunds {
+		refunds[i] = RazorpayRefund{
+			ID:        fmt.Sprintf("rfnd_page_%d_%d", skip, i),
+			PaymentID: paymentID,
+			Amount:    5000,
+			Currency:  "INR",
+			Status:    "processed",
+			Notes:     map[string]string{"trailnest_refund_id": uuid.NewString()},
+		}
+	}
+
+	return refunds, nil
+}
+
+func TestRecoverStaleRefundsContinuesAfterJobError(t *testing.T) {
+	pool := openTestPool(t)
+	repo := NewRepository(pool)
+	ctx := context.Background()
+
+	firstFixture, firstID := prepareRefundCompletionFixture(
+		t, pool, "processing",
+	)
+	secondFixture, secondID := prepareRefundCompletionFixture(
+		t, pool, "processing",
+	)
+
+	_, err := pool.Exec(ctx, `
+		UPDATE payment_refunds
+		SET provider = 'razorpay',
+		    claimed_at = NOW() - INTERVAL '2 hours'
+		WHERE id = $1
+	`, firstID)
+	require.NoError(t, err)
+
+	_, err = pool.Exec(ctx, `
+		UPDATE payment_refunds
+		SET provider = 'razorpay',
+		    claimed_at = NOW() - INTERVAL '1 hour'
+		WHERE id = $1
+	`, secondID)
+	require.NoError(t, err)
+
+	provider := &fakeRefundProvider{
+		listErrorsByPayment: map[string]error{
+			firstFixture.providerPaymentID: errors.New("simulated provider error"),
+		},
+		listedRefunds: []RazorpayRefund{
+			{
+				ID:        "rfnd_second_job",
+				PaymentID: secondFixture.providerPaymentID,
+				Amount:    5000,
+				Currency:  "INR",
+				Status:    "processed",
+				Notes: map[string]string{
+					"trailnest_refund_id": secondID.String(),
+				},
+			},
+		},
+	}
+
+	worker := NewRefundWorker(repo, provider)
+
+	err = worker.RecoverStaleRefunds(ctx, 30*time.Minute, 100)
+	require.ErrorContains(t, err, "simulated provider error")
+
+	var firstStatus, secondStatus string
+	var firstProviderRefundID, secondProviderRefundID *string
+
+	err = pool.QueryRow(ctx, `
+		SELECT status, provider_refund_id
+		FROM payment_refunds
+		WHERE id = $1
+	`, firstID).Scan(&firstStatus, &firstProviderRefundID)
+	require.NoError(t, err)
+
+	err = pool.QueryRow(ctx, `
+		SELECT status, provider_refund_id
+		FROM payment_refunds
+		WHERE id = $1
+	`, secondID).Scan(&secondStatus, &secondProviderRefundID)
+	require.NoError(t, err)
+
+	require.Equal(t, "processing", firstStatus)
+	require.Nil(t, firstProviderRefundID)
+
+	require.Equal(t, "review_required", secondStatus)
+	require.NotNil(t, secondProviderRefundID)
+	require.Equal(t, "rfnd_second_job", *secondProviderRefundID)
+}
+
+func TestRecoverStaleRefundsRejectsUnexpectedStatus(t *testing.T) {
+	pool := openTestPool(t)
+	repo := NewRepository(pool)
+
+	f, refundID := prepareRefundCompletionFixture(t, pool, "processing")
+
+	_, err := pool.Exec(context.Background(), `
+		UPDATE payment_refunds
+		SET provider = 'razorpay',
+		    claimed_at = NOW() - INTERVAL '1 hour'
+		WHERE id = $1
+	`, refundID)
+	require.NoError(t, err)
+
+	provider := &fakeRefundProvider{
+		listedRefunds: []RazorpayRefund{
+			{
+				ID:        "rfnd_unexpected_status",
+				PaymentID: f.providerPaymentID,
+				Amount:    5000,
+				Currency:  "INR",
+				Status:    "unknown",
+				Notes: map[string]string{
+					"trailnest_refund_id": refundID.String(),
+				},
+			},
+		},
+	}
+
+	worker := NewRefundWorker(repo, provider)
+
+	err = worker.RecoverStaleRefunds(
+		context.Background(),
+		30*time.Minute,
+		100,
+	)
+	require.ErrorContains(t, err, "unexpected provider refund status")
+
+	var status string
+	var providerRefundID *string
+	err = pool.QueryRow(context.Background(), `
+		SELECT status, provider_refund_id
+		FROM payment_refunds
+		WHERE id = $1
+	`, refundID).Scan(&status, &providerRefundID)
+	require.NoError(t, err)
+
+	require.Equal(t, "processing", status)
+	require.Nil(t, providerRefundID)
 }

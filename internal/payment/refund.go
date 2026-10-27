@@ -135,6 +135,74 @@ func (r *Repository) ClaimRefundJob(ctx context.Context) (RefundJob, error) {
 	return r.claimRefundJob(ctx, nil)
 }
 
+func (r *Repository) ListStaleRefundJobs(
+	ctx context.Context,
+	olderThan time.Duration,
+	limit int,
+) ([]RefundJob, error) {
+	if olderThan <= 0 {
+		return nil, errors.New("stale refund age must be positive")
+	}
+	if limit < 1 || limit > 100 {
+		return nil, errors.New("stale refund job limit must be between 1 and 100")
+	}
+
+	rows, err := r.pool.Query(ctx, `
+		SELECT
+			id,
+			payment_id,
+			provider,
+			provider_payment_id,
+			COALESCE(provider_refund_id, ''),
+			idempotency_key,
+			amount_minor,
+			currency,
+			status,
+			attempt_count,
+			claimed_at,
+			COALESCE(last_error, '')
+		FROM payment_refunds
+		WHERE status = 'processing'
+		  AND claimed_at IS NOT NULL
+		  AND claimed_at < NOW() - ($1 * INTERVAL '1 microsecond')
+		  AND provider_refund_id IS NULL
+		ORDER BY claimed_at, id
+		LIMIT $2
+	`, olderThan.Microseconds(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("list stale refund jobs: %w", err)
+	}
+	defer rows.Close()
+
+	var jobs []RefundJob
+	for rows.Next() {
+		var job RefundJob
+		if err := rows.Scan(
+			&job.ID,
+			&job.PaymentID,
+			&job.Provider,
+			&job.ProviderPaymentID,
+			&job.ProviderRefundID,
+			&job.IdempotencyKey,
+			&job.AmountMinor,
+			&job.Currency,
+			&job.Status,
+			&job.AttemptCount,
+			&job.ClaimedAt,
+			&job.LastError,
+		); err != nil {
+			return nil, fmt.Errorf("scan stale refund job: %w", err)
+		}
+		jobs = append(jobs, job)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate stale refund jobs: %w", err)
+	}
+
+	return jobs, nil
+}
+
 // claimRefundJob claims a specific refund when refundJobID is provided.
 // A nil ID claims the oldest available pending refund.
 func (r *Repository) claimRefundJob(
@@ -392,6 +460,69 @@ func (r *Repository) MarkReconciledRefundSucceeded(
 	return nil
 }
 
+func (r *Repository) MarkRefundRecoveredForReview(
+	ctx context.Context,
+	refundJobID uuid.UUID,
+	providerRefundID string,
+	reason string,
+) error {
+	providerRefundID = strings.TrimSpace(providerRefundID)
+	reason = strings.TrimSpace(reason)
+
+	if providerRefundID == "" {
+		return errors.New("provider refund ID is required")
+	}
+	if reason == "" {
+		reason = "provider refund recovered; reconciliation required"
+	}
+
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE payment_refunds
+		SET provider_refund_id = $2,
+		    status = 'review_required',
+		    last_error = $3,
+		    updated_at = NOW()
+		WHERE id = $1
+		  AND status = 'processing'
+		  AND (
+		      provider_refund_id IS NULL
+		      OR provider_refund_id = $2
+		  )
+	`, refundJobID, providerRefundID, reason)
+	if err != nil {
+		return fmt.Errorf("save recovered refund for review: %w", err)
+	}
+
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+
+	// Another recovery attempt may already have completed this transition.
+	// Treat it as successful only when the stored provider refund ID agrees.
+	var status string
+	var existingProviderRefundID string
+
+	err = r.pool.QueryRow(ctx, `
+		SELECT status, COALESCE(provider_refund_id, '')
+		FROM payment_refunds
+		WHERE id = $1
+	`, refundJobID).Scan(&status, &existingProviderRefundID)
+	if err != nil {
+		return fmt.Errorf("inspect refund after recovery conflict: %w", err)
+	}
+
+	if status == "review_required" &&
+		existingProviderRefundID == providerRefundID {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"refund job cannot be recovered: status=%q, provider refund ID=%q",
+		status,
+		existingProviderRefundID,
+	)
+}
+
 func (r *Repository) MarkRefundForReview(
 	ctx context.Context,
 	refundJobID uuid.UUID,
@@ -557,6 +688,161 @@ func (w *RefundWorker) processClaimedRefund(
 		}
 		return errors.New(reason)
 	}
+}
+
+func (w *RefundWorker) RecoverStaleRefunds(
+	ctx context.Context,
+	olderThan time.Duration,
+	limit int,
+) error {
+	if w == nil || w.repository == nil || w.provider == nil {
+		return errors.New("refund worker is not properly configured")
+	}
+
+	lister, ok := w.provider.(RefundListProvider)
+	if !ok {
+		return errors.New("refund provider does not support listing refunds")
+	}
+
+	jobs, err := w.repository.ListStaleRefundJobs(ctx, olderThan, limit)
+	if err != nil {
+		return fmt.Errorf("list stale refund jobs: %w", err)
+	}
+
+	var recoveryErrors []error
+
+	for _, job := range jobs {
+		if err := ctx.Err(); err != nil {
+			recoveryErrors = append(recoveryErrors, err)
+			break
+		}
+
+		if job.Provider != "razorpay" {
+			continue
+		}
+
+		if err := w.recoverStaleRefundJob(ctx, lister, job); err != nil {
+			recoveryErrors = append(recoveryErrors, err)
+
+			// Stop promptly if the caller cancelled the operation.
+			if ctx.Err() != nil {
+				recoveryErrors = append(recoveryErrors, ctx.Err())
+				break
+			}
+
+			// A failure for one job must not block other jobs.
+			continue
+		}
+	}
+
+	return errors.Join(recoveryErrors...)
+}
+
+func (w *RefundWorker) recoverStaleRefundJob(
+	ctx context.Context,
+	lister RefundListProvider,
+	job RefundJob,
+) error {
+	var matched *RazorpayRefund
+
+	const (
+		pageSize = 100
+		maxPages = 10
+	)
+
+	for page := 0; page < maxPages; page++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		skip := page * pageSize
+
+		refunds, err := lister.ListPaymentRefunds(
+			ctx,
+			job.ProviderPaymentID,
+			pageSize,
+			skip,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"list refunds for stale job %s: %w",
+				job.ID,
+				err,
+			)
+		}
+
+		for i := range refunds {
+			refund := &refunds[i]
+
+			if refund.Notes["trailnest_refund_id"] != job.ID.String() {
+				continue
+			}
+
+			if matched != nil {
+				return fmt.Errorf(
+					"multiple provider refunds match stale job %s",
+					job.ID,
+				)
+			}
+
+			if refund.ID == "" ||
+				refund.PaymentID != job.ProviderPaymentID ||
+				refund.Amount != job.AmountMinor ||
+				strings.TrimSpace(refund.Currency) != strings.TrimSpace(job.Currency) {
+				return fmt.Errorf(
+					"provider refund details do not match stale job %s",
+					job.ID,
+				)
+			}
+
+			switch refund.Status {
+			case "pending", "processed", "failed":
+				// Recognized provider status; still requires reconciliation.
+			default:
+				return fmt.Errorf(
+					"unexpected provider refund status %q for stale job %s",
+					refund.Status,
+					job.ID,
+				)
+			}
+
+			copy := *refund
+			matched = &copy
+		}
+
+		if len(refunds) < pageSize {
+			break
+		}
+
+		if page == maxPages-1 {
+			return fmt.Errorf(
+				"refund listing exceeded %d pages for stale job %s",
+				maxPages,
+				job.ID,
+			)
+		}
+	}
+
+	if matched == nil {
+		// A missing listing result does not prove that the original
+		// provider request failed. Leave this job unchanged.
+		return nil
+	}
+
+	if err := w.repository.MarkRefundRecoveredForReview(
+		ctx,
+		job.ID,
+		matched.ID,
+		"provider refund recovered; reconciliation required",
+	); err != nil {
+		return fmt.Errorf(
+			"save recovered provider refund for job %s: %w",
+			job.ID,
+			err,
+		)
+	}
+
+	return nil
 }
 
 func (w *RefundWorker) ReconcileRefund(
