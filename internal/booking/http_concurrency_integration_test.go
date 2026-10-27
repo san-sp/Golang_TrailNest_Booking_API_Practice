@@ -23,6 +23,8 @@ func TestConcurrentBookingHTTPRequestsRespectCapacity(t *testing.T) {
 		"published",
 	)
 
+	makeActivityFree(t, pool, activityID)
+
 	repo := NewRepository(pool)
 
 	// Fill 9 of the activity's 10 spots.

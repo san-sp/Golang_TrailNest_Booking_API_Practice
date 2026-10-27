@@ -100,6 +100,17 @@ func createBookingActivityFixture(t *testing.T, pool *pgxpool.Pool, status strin
 	return customerID, activityID
 }
 
+func makeActivityFree(t *testing.T, pool *pgxpool.Pool, activityID uuid.UUID) {
+	t.Helper()
+
+	_, err := pool.Exec(
+		t.Context(),
+		`UPDATE activities SET price_minor = 0 WHERE id = $1`,
+		activityID,
+	)
+	require.NoError(t, err)
+}
+
 func TestCreateReturnsActivityNotFound(t *testing.T) {
 	pool := openBookingTestPool(t)
 	repo := NewRepository(pool)
@@ -171,6 +182,8 @@ func TestCreateRejectsBookingOverCapacity(t *testing.T) {
 		"published",
 	)
 
+	makeActivityFree(t, pool, activityID)
+
 	// The fixture creates an activity with capacity 10.
 	// Fill 8 seats with an existing confirmed booking.
 	_, err := pool.Exec(
@@ -195,6 +208,36 @@ func TestCreateRejectsBookingOverCapacity(t *testing.T) {
 	require.ErrorIs(t, err, ErrInsufficientCapacity)
 }
 
+func TestCreateRejectsPaidActivityWithoutPayment(t *testing.T) {
+	pool := openBookingTestPool(t)
+	repo := NewRepository(pool)
+
+	customerID, activityID := createBookingActivityFixture(
+		t,
+		pool,
+		"published",
+	)
+
+	_, err := repo.Create(
+		t.Context(),
+		customerID,
+		activityID,
+		1,
+	)
+
+	require.ErrorIs(t, err, ErrPaymentRequired)
+
+	var bookingCount int
+	err = pool.QueryRow(
+		t.Context(),
+		`SELECT COUNT(*) FROM bookings WHERE activity_id = $1`,
+		activityID,
+	).Scan(&bookingCount)
+
+	require.NoError(t, err)
+	require.Zero(t, bookingCount)
+}
+
 func TestCreateBookingSuccessfully(t *testing.T) {
 	pool := openBookingTestPool(t)
 	repo := NewRepository(pool)
@@ -204,6 +247,8 @@ func TestCreateBookingSuccessfully(t *testing.T) {
 		pool,
 		"published",
 	)
+
+	makeActivityFree(t, pool, activityID)
 
 	created, err := repo.Create(
 		t.Context(),
@@ -232,6 +277,8 @@ func TestCreateConcurrentBookingsRespectCapacity(t *testing.T) {
 		pool,
 		"published",
 	)
+
+	makeActivityFree(t, pool, activityID)
 
 	customerIDs := make([]uuid.UUID, customerCount)
 
@@ -351,6 +398,8 @@ func TestCancelBookingSuccessfully(t *testing.T) {
 		"published",
 	)
 
+	makeActivityFree(t, pool, activityID)
+
 	created, err := repo.Create(
 		t.Context(),
 		customerID,
@@ -384,6 +433,8 @@ func TestCancelBookingTwiceReturnsError(t *testing.T) {
 		"published",
 	)
 
+	makeActivityFree(t, pool, activityID)
+
 	created, err := repo.Create(
 		t.Context(),
 		customerID,
@@ -408,6 +459,8 @@ func TestConcurrentBookingCancellationsOnlyCancelOnce(t *testing.T) {
 		pool,
 		"published",
 	)
+
+	makeActivityFree(t, pool, activityID)
 
 	created, err := repo.Create(t.Context(), customerID, activityID, 3)
 	require.NoError(t, err)
@@ -478,6 +531,8 @@ func TestCancelledBookingReleasesCapacity(t *testing.T) {
 		"published",
 	)
 
+	makeActivityFree(t, pool, activityID)
+
 	firstBooking, err := repo.Create(
 		t.Context(),
 		customerID,
@@ -510,6 +565,8 @@ func TestCancelBookingWithin24HoursReturnsDeadlineError(t *testing.T) {
 		pool,
 		"published",
 	)
+
+	makeActivityFree(t, pool, activityID)
 
 	created, err := repo.Create(
 		t.Context(),
@@ -554,6 +611,8 @@ func TestCancelBookingAfterCancellationDeadlineReturnsError(t *testing.T) {
 		"published",
 	)
 
+	makeActivityFree(t, pool, activityID)
+
 	created, err := repo.Create(
 		t.Context(),
 		customerID,
@@ -597,6 +656,8 @@ func TestCancelBookingTwiceAfterDeadlineReturnsAlreadyCancelled(t *testing.T) {
 		"published",
 	)
 
+	makeActivityFree(t, pool, activityID)
+
 	created, err := repo.Create(t.Context(), customerID, activityID, 1)
 	require.NoError(t, err)
 
@@ -628,6 +689,8 @@ func TestGetByIDRejectsAnotherCustomersBooking(t *testing.T) {
 		pool,
 		"published",
 	)
+
+	makeActivityFree(t, pool, activityID)
 
 	booking, err := repo.Create(
 		t.Context(),
@@ -682,6 +745,8 @@ func TestGetByIDReturnsOwnBooking(t *testing.T) {
 		"published",
 	)
 
+	makeActivityFree(t, pool, activityID)
+
 	created, err := repo.Create(
 		t.Context(),
 		customerID,
@@ -716,6 +781,8 @@ func TestListByCustomerReturnsOnlyOwnBookings(t *testing.T) {
 		pool,
 		"published",
 	)
+
+	makeActivityFree(t, pool, activityID)
 
 	booking1, err := repo.Create(
 		t.Context(),
@@ -789,6 +856,8 @@ func TestGetAdminByIDReturnsBooking(t *testing.T) {
 		"published",
 	)
 
+	makeActivityFree(t, pool, activityID)
+
 	created, err := repo.Create(
 		t.Context(),
 		customerID,
@@ -830,6 +899,8 @@ func TestListAllAdminRespectsLimitAndOffset(t *testing.T) {
 		pool,
 		"published",
 	)
+
+	makeActivityFree(t, pool, activityID)
 
 	createdIDs := make(map[uuid.UUID]bool, 3)
 

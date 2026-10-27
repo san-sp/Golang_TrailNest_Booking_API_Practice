@@ -20,6 +20,7 @@ var (
 	ErrCancellationDeadlinePassed = errors.New(
 		"booking cancellation deadline has passed",
 	)
+	ErrPaymentRequired = errors.New("payment is required for this activity")
 )
 
 type Booking struct {
@@ -63,13 +64,19 @@ func (r *Repository) Create(
 	var capacity int
 	var status string
 	var startsAt time.Time
+	var priceMinor int64
 
 	err = tx.QueryRow(ctx, `
-    SELECT capacity, status, starts_at
+    SELECT capacity, status, starts_at, price_minor
     FROM activities
     WHERE id = $1
     FOR UPDATE
-`, activityID).Scan(&capacity, &status, &startsAt)
+`, activityID).Scan(
+		&capacity,
+		&status,
+		&startsAt,
+		&priceMinor,
+	)
 
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Booking{}, ErrActivityNotFound
@@ -84,6 +91,10 @@ func (r *Repository) Create(
 
 	if status != "published" {
 		return Booking{}, ErrActivityNotBookable
+	}
+
+	if priceMinor > 0 {
+		return Booking{}, ErrPaymentRequired
 	}
 
 	var bookedQuantity int

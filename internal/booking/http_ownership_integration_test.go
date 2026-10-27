@@ -61,6 +61,59 @@ func TestBookingHTTPRejectsUnauthenticatedRequests(t *testing.T) {
 	}
 }
 
+func TestBookingHTTPRejectsPaidActivityWithoutPayment(t *testing.T) {
+	pool := openBookingTestPool(t)
+
+	customerID, activityID := createBookingActivityFixture(
+		t,
+		pool,
+		"published",
+	)
+
+	repo := NewRepository(pool)
+
+	tokens, err := auth.NewTokenManager(
+		"trailnest-http-paid-booking-test-secret-32-bytes",
+	)
+	require.NoError(t, err)
+
+	token, err := tokens.CreateAccessToken(customerID, "customer")
+	require.NoError(t, err)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(auth.RequireAuthentication(tokens))
+	router.POST("/api/v1/bookings", NewHandler(repo).Create)
+
+	body := bytes.NewBufferString(
+		`{"activity_id":"` + activityID.String() + `","quantity":1}`,
+	)
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/bookings",
+		body,
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	require.Equal(t, http.StatusConflict, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "PAYMENT_REQUIRED")
+
+	var bookingCount int
+	err = pool.QueryRow(
+		t.Context(),
+		`SELECT COUNT(*) FROM bookings WHERE activity_id = $1`,
+		activityID,
+	).Scan(&bookingCount)
+
+	require.NoError(t, err)
+	require.Zero(t, bookingCount)
+}
+
 func TestBookingHTTPPreventsAccessToAnotherCustomersBooking(t *testing.T) {
 	pool := openBookingTestPool(t)
 
@@ -69,6 +122,8 @@ func TestBookingHTTPPreventsAccessToAnotherCustomersBooking(t *testing.T) {
 		pool,
 		"published",
 	)
+
+	makeActivityFree(t, pool, activityID)
 
 	repo := NewRepository(pool)
 	booking, err := repo.Create(t.Context(), ownerID, activityID, 1)

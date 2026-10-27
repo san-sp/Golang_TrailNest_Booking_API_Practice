@@ -111,6 +111,14 @@ func (h *Handler) Create(c *gin.Context) {
 			response.Error(c, http.StatusConflict, "ACTIVITY_NOT_AVAILABLE", "This activity is not available for booking.", nil)
 		case errors.Is(err, ErrInsufficientCapacity):
 			response.Error(c, http.StatusConflict, "INSUFFICIENT_CAPACITY", "Not enough spots are available.", nil)
+		case errors.Is(err, ErrPaymentRequired):
+			response.Error(
+				c,
+				http.StatusConflict,
+				"PAYMENT_REQUIRED",
+				"This activity requires payment through checkout.",
+				nil,
+			)
 		default:
 			slog.Error("create booking failed", "error", err)
 			response.Internal(c)
