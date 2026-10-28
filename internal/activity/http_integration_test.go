@@ -487,3 +487,139 @@ func TestOperatorUploadImageRejectsMissingImage(t *testing.T) {
 	require.Equal(t, 0, fakeStorage.saveCalls)
 	require.Empty(t, fakeStorage.deleteURLs)
 }
+
+func TestOperatorUpdateAndStatusRequireActivityOwnership(t *testing.T) {
+	pool := openActivityTestPool(t)
+	ctx := t.Context()
+
+	ownerID := uuid.New()
+	otherOperatorID := uuid.New()
+	activityID := uuid.New()
+
+	for _, operatorID := range []uuid.UUID{ownerID, otherOperatorID} {
+		_, err := pool.Exec(ctx, `
+			INSERT INTO users (
+				id, email, password_hash, role, email_verified
+			)
+			VALUES ($1, $2, 'test-hash', 'operator', TRUE)
+		`, operatorID, uuid.NewString()+"@example.test")
+		require.NoError(t, err)
+	}
+
+	_, err := pool.Exec(ctx, `
+		INSERT INTO activities (
+			id, owner_id, title, description, location,
+			starts_at, ends_at, capacity, status, price_minor, currency
+		)
+		VALUES (
+			$1, $2, 'Ownership test', 'Original description',
+			'Test location', NOW() + INTERVAL '2 days',
+			NOW() + INTERVAL '3 days', 10, 'draft', 0, 'INR'
+		)
+	`, activityID, ownerID)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(
+			context.Background(), 5*time.Second,
+		)
+		defer cancel()
+
+		_, err := pool.Exec(cleanupCtx,
+			`DELETE FROM activities WHERE id = $1`, activityID)
+		require.NoError(t, err)
+
+		_, err = pool.Exec(cleanupCtx,
+			`DELETE FROM users WHERE id = ANY($1)`,
+			[]uuid.UUID{ownerID, otherOperatorID})
+		require.NoError(t, err)
+	})
+
+	handler := NewHandler(NewRepository(pool))
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+
+	// Test-only identity injection. Production routes use JWT middleware.
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", c.GetHeader("X-Test-User-ID"))
+		c.Next()
+	})
+
+	router.PATCH("/activities/:activityID", handler.OperatorUpdate)
+	router.PATCH(
+		"/activities/:activityID/status",
+		handler.OperatorChangeStatus,
+	)
+
+	updateBody := `{
+		"title": "Changed title",
+		"description": "Changed description",
+		"location": "Changed location",
+		"starts_at": "2030-01-01T10:00:00Z",
+		"ends_at": "2030-01-01T12:00:00Z",
+		"capacity": 10,
+		"price_minor": 0,
+		"currency": "INR"
+	}`
+
+	send := func(method, path, body string, actorID uuid.UUID) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Test-User-ID", actorID.String())
+
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+
+	t.Run("another operator cannot update activity", func(t *testing.T) {
+		rec := send(
+			http.MethodPatch,
+			"/activities/"+activityID.String(),
+			updateBody,
+			otherOperatorID,
+		)
+
+		require.Equal(t, http.StatusNotFound, rec.Code)
+		require.Contains(t, rec.Body.String(), "ACTIVITY_NOT_FOUND")
+	})
+
+	t.Run("another operator cannot publish activity", func(t *testing.T) {
+		rec := send(
+			http.MethodPatch,
+			"/activities/"+activityID.String()+"/status",
+			`{"status":"published"}`,
+			otherOperatorID,
+		)
+
+		require.Equal(t, http.StatusNotFound, rec.Code)
+		require.Contains(t, rec.Body.String(), "ACTIVITY_NOT_FOUND")
+	})
+
+	t.Run("owner can update and publish activity", func(t *testing.T) {
+		rec := send(
+			http.MethodPatch,
+			"/activities/"+activityID.String(),
+			updateBody,
+			ownerID,
+		)
+		require.Equal(t, http.StatusOK, rec.Code)
+
+		rec = send(
+			http.MethodPatch,
+			"/activities/"+activityID.String()+"/status",
+			`{"status":"published"}`,
+			ownerID,
+		)
+		require.Equal(t, http.StatusOK, rec.Code)
+	})
+
+	var title, status string
+	err = pool.QueryRow(ctx, `
+		SELECT title, status FROM activities WHERE id = $1
+	`, activityID).Scan(&title, &status)
+	require.NoError(t, err)
+	require.Equal(t, "Changed title", title)
+	require.Equal(t, "published", status)
+}
