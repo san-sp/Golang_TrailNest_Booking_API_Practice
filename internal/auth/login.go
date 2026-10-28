@@ -3,7 +3,6 @@ package auth
 import (
 	"encoding/json"
 	"errors"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -50,7 +49,20 @@ func (h *LoginHandler) Login(c *gin.Context) {
 	decoder.DisallowUnknownFields()
 
 	var input loginRequest
+
 	if err := decoder.Decode(&input); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			response.Error(
+				c,
+				http.StatusRequestEntityTooLarge,
+				"REQUEST_TOO_LARGE",
+				"Request body exceeds the maximum allowed size.",
+				nil,
+			)
+			return
+		}
+
 		response.Error(
 			c,
 			http.StatusBadRequest,
@@ -62,7 +74,18 @@ func (h *LoginHandler) Login(c *gin.Context) {
 	}
 
 	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+	if err := decoder.Decode(&extra); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			response.Error(
+				c,
+				http.StatusRequestEntityTooLarge,
+				"REQUEST_TOO_LARGE",
+				"Request body exceeds the maximum allowed size.",
+				nil,
+			)
+			return
+		}
 		response.Error(
 			c,
 			http.StatusBadRequest,
