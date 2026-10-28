@@ -81,6 +81,8 @@ func main() {
 		},
 	}))
 
+	router.Use(middleware.SecurityHeaders())
+
 	router.Static(
 		cfg.ImageStoragePublicURL,
 		cfg.ImageStorageDirectory,
