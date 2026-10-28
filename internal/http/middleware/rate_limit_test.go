@@ -191,3 +191,74 @@ func TestRateLimiterTracksClientsIndependently(t *testing.T) {
 	secondClient := request("192.0.2.20:12345")
 	require.Equal(t, http.StatusOK, secondClient.Code)
 }
+
+func TestRateLimiterCannotBeBypassedWithSpoofedForwardedIP(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	limiter := NewRateLimiter(1, time.Minute)
+	router := gin.New()
+
+	// No trusted proxies are configured.
+	require.NoError(t, router.SetTrustedProxies(nil))
+
+	router.Use(limiter.Middleware())
+	router.GET("/", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	request := func(forwardedIP string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = "192.0.2.10:12345"
+
+		// A client can freely supply this header.
+		req.Header.Set("X-Forwarded-For", forwardedIP)
+
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+
+	first := request("198.51.100.10")
+	require.Equal(t, http.StatusOK, first.Code)
+
+	// Changing the forwarded IP must not create a new rate-limit identity.
+	second := request("203.0.113.20")
+	require.Equal(t, http.StatusTooManyRequests, second.Code)
+}
+
+func TestRateLimiterUsesForwardedIPFromTrustedProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	limiter := NewRateLimiter(1, time.Minute)
+	router := gin.New()
+
+	// Trust only this specific reverse proxy.
+	require.NoError(t, router.SetTrustedProxies([]string{"192.0.2.10"}))
+
+	router.Use(limiter.Middleware())
+	router.GET("/", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	request := func(forwardedIP string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = "192.0.2.10:8080"
+		req.Header.Set("X-Forwarded-For", forwardedIP)
+
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// These requests come through the trusted proxy but represent
+	// different client IPs, so each gets its own rate-limit bucket.
+	first := request("198.51.100.10")
+	require.Equal(t, http.StatusOK, first.Code)
+
+	second := request("203.0.113.20")
+	require.Equal(t, http.StatusOK, second.Code)
+
+	// The first client's limit is still enforced.
+	firstAgain := request("198.51.100.10")
+	require.Equal(t, http.StatusTooManyRequests, firstAgain.Code)
+}

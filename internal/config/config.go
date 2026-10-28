@@ -20,6 +20,7 @@ type Config struct {
 	RazorpayWebhookSecret string
 	ImageStorageDirectory string
 	ImageStoragePublicURL string
+	TrustedProxies        []string
 }
 
 func Load() (Config, error) {
@@ -78,6 +79,18 @@ func Load() (Config, error) {
 		imageStoragePublicURL = "/uploads/activities"
 	}
 
+	var trustedProxies []string
+
+	for _, proxy := range strings.Split(
+		os.Getenv("TRUSTED_PROXIES"),
+		",",
+	) {
+		proxy = strings.TrimSpace(proxy)
+		if proxy != "" {
+			trustedProxies = append(trustedProxies, proxy)
+		}
+	}
+
 	return Config{
 		Port:                  port,
 		DatabaseURL:           strings.TrimSpace(os.Getenv("DATABASE_URL")),
@@ -91,5 +104,6 @@ func Load() (Config, error) {
 		RazorpayWebhookSecret: razorpayWebhookSecret,
 		ImageStorageDirectory: imageStorageDirectory,
 		ImageStoragePublicURL: imageStoragePublicURL,
+		TrustedProxies:        trustedProxies,
 	}, nil
 }

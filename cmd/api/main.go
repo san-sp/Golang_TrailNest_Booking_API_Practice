@@ -58,6 +58,10 @@ func main() {
 
 	router := gin.New()
 
+	if err := router.SetTrustedProxies(cfg.TrustedProxies); err != nil {
+		log.Fatalf("configure trusted proxies: %v", err)
+	}
+
 	router.Use(cors.New(cors.Config{
 		AllowOrigins: []string{
 			"http://localhost:8090",
