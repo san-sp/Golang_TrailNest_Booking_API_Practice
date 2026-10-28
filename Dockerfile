@@ -20,6 +20,9 @@ WORKDIR /app
 
 COPY --from=builder /out/trailnest-api /app/trailnest-api
 
+RUN mkdir -p /app/uploads/activities \
+    && chown -R app:app /app/uploads
+
 USER app
 
 EXPOSE 8080

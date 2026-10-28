@@ -27,6 +27,7 @@ services:
       - .env.docker
     volumes:
       - ./.env.docker:/app/.env:ro
+      - trailnest_uploads:/app/uploads
     environment:
       PORT: '8080'
     ports:
@@ -37,3 +38,4 @@ services:
 
 volumes:
   trailnest_postgres_data:
+  trailnest_uploads:

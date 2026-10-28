@@ -19,3 +19,6 @@
 
 # Temporary local files
 /tmp/
+
+# Local database backups
+/backups/
