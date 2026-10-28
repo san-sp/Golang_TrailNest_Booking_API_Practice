@@ -262,3 +262,76 @@ func TestRateLimiterUsesForwardedIPFromTrustedProxy(t *testing.T) {
 	firstAgain := request("198.51.100.10")
 	require.Equal(t, http.StatusTooManyRequests, firstAgain.Code)
 }
+
+func TestRateLimiterRejectsNewClientsAtCapacity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	limiter := NewRateLimiter(2, time.Minute)
+	limiter.maxEntries = 2
+
+	router := gin.New()
+	router.Use(limiter.Middleware())
+	router.GET("/", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	request := func(ip string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = ip + ":12345"
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+
+	require.Equal(t, http.StatusOK, request("192.0.2.10").Code)
+	require.Equal(t, http.StatusOK, request("192.0.2.20").Code)
+
+	// Existing clients retain their counters at capacity.
+	require.Equal(t, http.StatusOK, request("192.0.2.10").Code)
+
+	// A new client is rejected rather than evicting active entries.
+	rejected := request("192.0.2.30")
+	require.Equal(t, http.StatusTooManyRequests, rejected.Code)
+	require.NotEmpty(t, rejected.Header().Get("Retry-After"))
+	require.Len(t, limiter.entries, 2)
+}
+
+func TestRateLimiterRecoversCapacityAfterExpiredEntry(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	limiter := NewRateLimiter(2, time.Minute)
+	limiter.maxEntries = 2
+
+	router := gin.New()
+	router.Use(limiter.Middleware())
+	router.GET("/", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	request := func(ip string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = ip + ":12345"
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+
+	require.Equal(t, http.StatusOK, request("192.0.2.10").Code)
+	require.Equal(t, http.StatusOK, request("192.0.2.20").Code)
+
+	// Make one entry expired without waiting for a real minute.
+	limiter.mu.Lock()
+	entry := limiter.entries["192.0.2.10"]
+	entry.windowStart = time.Now().Add(-2 * time.Minute)
+	limiter.entries["192.0.2.10"] = entry
+
+	// Prevent periodic cleanup from running on the next request.
+	// This forces the limiter to recover capacity through its full-map path.
+	limiter.lastCleanup = time.Now()
+	limiter.mu.Unlock()
+
+	// Capacity-triggered cleanup should free the expired slot.
+	require.Equal(t, http.StatusOK, request("192.0.2.30").Code)
+	require.Len(t, limiter.entries, 2)
+	require.NotContains(t, limiter.entries, "192.0.2.10")
+}
