@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"time"
+	"trailnest/internal/cancellation"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -738,6 +739,38 @@ func (r *Repository) changeStatus(
 ) (Activity, error) {
 	if newStatus != "published" && newStatus != "cancelled" {
 		return Activity{}, ErrInvalidActivityTransition
+	}
+
+	if newStatus == "cancelled" {
+		service := cancellation.NewService(r.pool)
+
+		cancelled, err := service.CancelActivity(ctx, id, ownerID)
+		if err != nil {
+			if errors.Is(err, cancellation.ErrActivityNotFound) {
+				return Activity{}, ErrActivityNotFound
+			}
+			if errors.Is(err, cancellation.ErrInvalidActivityTransition) {
+				return Activity{}, ErrInvalidActivityTransition
+			}
+			return Activity{}, err
+		}
+
+		return Activity{
+			ID:                cancelled.ID,
+			OwnerID:           cancelled.OwnerID,
+			Title:             cancelled.Title,
+			Description:       cancelled.Description,
+			Location:          cancelled.Location,
+			StartsAt:          cancelled.StartsAt,
+			EndsAt:            cancelled.EndsAt,
+			Capacity:          cancelled.Capacity,
+			Status:            cancelled.Status,
+			CreatedAt:         cancelled.CreatedAt,
+			RemainingCapacity: cancelled.RemainingCapacity,
+			PriceMinor:        cancelled.PriceMinor,
+			Currency:          cancelled.Currency,
+			ImageURL:          cancelled.ImageURL,
+		}, nil
 	}
 
 	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{})

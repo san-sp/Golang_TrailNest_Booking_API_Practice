@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"trailnest/internal/activity"
 	"trailnest/internal/reservation"
 
 	"github.com/gin-gonic/gin"
@@ -2035,4 +2036,292 @@ func TestSuccessfulPaymentForCancelledActivityRequiresRefund(t *testing.T) {
 	`, "mock", eventID).Scan(&eventStatus)
 	require.NoError(t, err)
 	require.Equal(t, "processed", eventStatus)
+}
+
+func TestCancellingActivityCancelsBookingAndCreatesRefundJob(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+
+	f := createWebhookFixture(t, pool)
+
+	// Set up a previously fulfilled payment and confirmed booking.
+	_, err := pool.Exec(ctx, `
+		UPDATE reservations
+		SET status = 'confirmed'
+		WHERE id = $1
+	`, f.reservationID)
+	require.NoError(t, err)
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO bookings (
+			customer_id, activity_id, reservation_id, quantity, status
+		)
+		VALUES ($1, $2, $3, 2, 'confirmed')
+	`, f.customerID, f.activityID, f.reservationID)
+	require.NoError(t, err)
+
+	_, err = pool.Exec(ctx, `
+		UPDATE payments
+		SET status = 'succeeded',
+		    fulfillment_status = 'fulfilled'
+		WHERE id = $1
+	`, f.paymentID)
+	require.NoError(t, err)
+
+	// Cancel through the existing activity repository.
+	activityRepo := activity.NewRepository(pool)
+	_, err = activityRepo.ChangeStatus(ctx, f.activityID, "cancelled")
+	require.NoError(t, err)
+
+	// The activity must be cancelled.
+	var activityStatus string
+	err = pool.QueryRow(ctx, `
+		SELECT status
+		FROM activities
+		WHERE id = $1
+	`, f.activityID).Scan(&activityStatus)
+	require.NoError(t, err)
+	require.Equal(t, "cancelled", activityStatus)
+
+	// The confirmed booking must be cancelled.
+	var bookingStatus string
+	err = pool.QueryRow(ctx, `
+		SELECT status
+		FROM bookings
+		WHERE reservation_id = $1
+	`, f.reservationID).Scan(&bookingStatus)
+	require.NoError(t, err)
+	require.Equal(t, "cancelled", bookingStatus)
+
+	// The paid customer must have exactly one durable refund job.
+	var refundCount int
+	var provider string
+	var providerPaymentID string
+	var amountMinor int64
+	var currency string
+	var refundStatus string
+
+	err = pool.QueryRow(ctx, `
+		SELECT COUNT(*),
+		       COALESCE(MAX(provider), ''),
+		       COALESCE(MAX(provider_payment_id), ''),
+		       COALESCE(MAX(amount_minor), 0),
+		       COALESCE(MAX(currency), ''),
+		       COALESCE(MAX(status), '')
+		FROM payment_refunds
+		WHERE payment_id = $1
+	`, f.paymentID).Scan(
+		&refundCount,
+		&provider,
+		&providerPaymentID,
+		&amountMinor,
+		&currency,
+		&refundStatus,
+	)
+
+	require.NoError(t, err)
+
+	require.Equal(t, 1, refundCount)
+	require.Equal(t, "mock", provider)
+	require.Equal(t, f.providerPaymentID, providerPaymentID)
+	require.EqualValues(t, 5000, amountMinor)
+	require.Equal(t, "INR", currency)
+	require.Equal(t, "pending", refundStatus)
+
+	var paymentStatus string
+	var fulfillmentStatus string
+
+	err = pool.QueryRow(ctx, `
+    SELECT status, fulfillment_status
+    FROM payments
+    WHERE id = $1
+`, f.paymentID).Scan(&paymentStatus, &fulfillmentStatus)
+	require.NoError(t, err)
+
+	require.Equal(t, "succeeded", paymentStatus)
+	require.Equal(t, "refund_required", fulfillmentStatus)
+}
+
+func TestCancellingActivityCancelsPendingReservation(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+
+	f := createWebhookFixture(t, pool)
+
+	activityRepo := activity.NewRepository(pool)
+	_, err := activityRepo.ChangeStatus(ctx, f.activityID, "cancelled")
+	require.NoError(t, err)
+
+	var reservationStatus string
+	err = pool.QueryRow(ctx, `
+		SELECT status
+		FROM reservations
+		WHERE id = $1
+	`, f.reservationID).Scan(&reservationStatus)
+	require.NoError(t, err)
+
+	require.Equal(t, "cancelled", reservationStatus)
+
+	var refundCount int
+	err = pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM payment_refunds
+		WHERE payment_id = $1
+	`, f.paymentID).Scan(&refundCount)
+	require.NoError(t, err)
+
+	require.Equal(t, 0, refundCount)
+}
+
+func TestConcurrentActivityCancellationAndSuccessfulWebhookStayConsistent(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+	f := createWebhookFixture(t, pool)
+
+	paymentRepo := NewRepository(pool)
+	activityRepo := activity.NewRepository(pool)
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+
+	go func() {
+		<-start
+		errs <- paymentRepo.ProcessSuccessfulWebhook(
+			ctx,
+			"mock",
+			"event_"+uuid.NewString(),
+			"payment.succeeded",
+			f.providerPaymentID,
+		)
+	}()
+
+	go func() {
+		<-start
+		_, err := activityRepo.ChangeStatus(ctx, f.activityID, "cancelled")
+		errs <- err
+	}()
+
+	close(start)
+
+	require.NoError(t, <-errs)
+	require.NoError(t, <-errs)
+
+	var activityStatus, reservationStatus string
+	err := pool.QueryRow(ctx, `
+		SELECT a.status, r.status
+		FROM activities a
+		JOIN reservations r ON r.activity_id = a.id
+		WHERE a.id = $1 AND r.id = $2
+	`, f.activityID, f.reservationID).Scan(
+		&activityStatus,
+		&reservationStatus,
+	)
+	require.NoError(t, err)
+	require.Equal(t, "cancelled", activityStatus)
+
+	var confirmedBookingCount int
+	err = pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM bookings
+		WHERE reservation_id = $1
+		  AND status = 'confirmed'
+	`, f.reservationID).Scan(&confirmedBookingCount)
+	require.NoError(t, err)
+	require.Zero(t, confirmedBookingCount)
+
+	var paymentStatus, fulfillmentStatus string
+	err = pool.QueryRow(ctx, `
+		SELECT status, fulfillment_status
+		FROM payments
+		WHERE id = $1
+	`, f.paymentID).Scan(&paymentStatus, &fulfillmentStatus)
+	require.NoError(t, err)
+	require.Equal(t, "succeeded", paymentStatus)
+	require.Contains(t, []string{"refund_required", "refunded"}, fulfillmentStatus)
+
+	var refundCount int
+	err = pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM payment_refunds
+		WHERE payment_id = $1
+	`, f.paymentID).Scan(&refundCount)
+	require.NoError(t, err)
+	require.Equal(t, 1, refundCount)
+}
+
+func TestCancellingActivityPreservesFailedRefundJob(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+
+	f := createWebhookFixture(t, pool)
+
+	// Prepare a previously fulfilled payment and confirmed booking.
+	_, err := pool.Exec(ctx, `
+		UPDATE reservations
+		SET status = 'confirmed'
+		WHERE id = $1
+	`, f.reservationID)
+	require.NoError(t, err)
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO bookings (
+			customer_id, activity_id, reservation_id, quantity, status
+		)
+		VALUES ($1, $2, $3, 2, 'confirmed')
+	`, f.customerID, f.activityID, f.reservationID)
+	require.NoError(t, err)
+
+	_, err = pool.Exec(ctx, `
+		UPDATE payments
+		SET status = 'succeeded',
+		    fulfillment_status = 'fulfilled'
+		WHERE id = $1
+	`, f.paymentID)
+	require.NoError(t, err)
+
+	// An existing failed refund must not block activity cancellation.
+	_, err = pool.Exec(ctx, `
+		INSERT INTO payment_refunds (
+			payment_id, provider, provider_payment_id,
+			idempotency_key, amount_minor, currency, status,
+			attempt_count, last_error
+		)
+		VALUES ($1, 'mock', $2, $3, 5000, 'INR', 'failed', 1,
+		        'provider reported refund failure')
+	`, f.paymentID, f.providerPaymentID, "trailnest-refund-"+f.paymentID.String())
+	require.NoError(t, err)
+
+	activityRepo := activity.NewRepository(pool)
+	_, err = activityRepo.ChangeStatus(ctx, f.activityID, "cancelled")
+	require.NoError(t, err)
+
+	var activityStatus string
+	err = pool.QueryRow(ctx, `
+		SELECT status FROM activities WHERE id = $1
+	`, f.activityID).Scan(&activityStatus)
+	require.NoError(t, err)
+	require.Equal(t, "cancelled", activityStatus)
+
+	var refundCount int
+	var refundStatus, lastError string
+
+	err = pool.QueryRow(ctx, `
+		SELECT COUNT(*), COALESCE(MAX(status), ''), COALESCE(MAX(last_error), '')
+		FROM payment_refunds
+		WHERE payment_id = $1
+	`, f.paymentID).Scan(&refundCount, &refundStatus, &lastError)
+	require.NoError(t, err)
+	require.Equal(t, 1, refundCount)
+	require.Equal(t, "failed", refundStatus)
+	require.Equal(t, "provider reported refund failure", lastError)
+
+	var paymentStatus, fulfillmentStatus string
+	err = pool.QueryRow(ctx, `
+		SELECT status, fulfillment_status
+		FROM payments
+		WHERE id = $1
+	`, f.paymentID).Scan(&paymentStatus, &fulfillmentStatus)
+	require.NoError(t, err)
+	require.Equal(t, "succeeded", paymentStatus)
+	require.Equal(t, "fulfilled", fulfillmentStatus)
 }
