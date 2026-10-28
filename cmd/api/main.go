@@ -316,6 +316,20 @@ func main() {
 		)
 	}()
 
+	// Recover stale refund jobs without creating duplicate provider refunds.
+	workerWG.Add(1)
+	go func() {
+		defer workerWG.Done()
+
+		payment.RunRefundRecoveryWorker(
+			shutdownCtx,
+			refundWorker,
+			5*time.Minute,
+			30*time.Minute,
+			20,
+		)
+	}()
+
 	serverErrors := make(chan error, 1)
 
 	go func() {
