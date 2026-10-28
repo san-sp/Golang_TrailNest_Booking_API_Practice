@@ -125,6 +125,56 @@ func TestSuccessfulWebhookIsIdempotent(t *testing.T) {
 	_ = time.Minute
 }
 
+func TestSuccessfulWebhookRejectsUnsupportedEventType(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+
+	f := createWebhookFixture(t, pool)
+	repo := NewRepository(pool)
+
+	eventID := "event_" + uuid.NewString()
+
+	err := repo.ProcessSuccessfulWebhook(
+		ctx,
+		"mock",
+		eventID,
+		"payment.failed",
+		f.providerPaymentID,
+	)
+	require.ErrorContains(t, err, "unsupported successful payment event type")
+
+	var paymentStatus, reservationStatus string
+
+	err = pool.QueryRow(ctx, `
+        SELECT p.status, r.status
+        FROM payments p
+        JOIN reservations r ON r.id = p.reservation_id
+        WHERE p.id = $1
+    `, f.paymentID).Scan(&paymentStatus, &reservationStatus)
+
+	require.NoError(t, err)
+	require.Equal(t, "pending", paymentStatus)
+	require.Equal(t, "pending", reservationStatus)
+
+	var bookingCount, eventCount int
+
+	err = pool.QueryRow(ctx, `
+        SELECT COUNT(*)
+        FROM bookings
+        WHERE reservation_id = $1
+    `, f.reservationID).Scan(&bookingCount)
+	require.NoError(t, err)
+	require.Zero(t, bookingCount)
+
+	err = pool.QueryRow(ctx, `
+        SELECT COUNT(*)
+        FROM payment_webhook_events
+        WHERE provider = $1 AND provider_event_id = $2
+    `, "mock", eventID).Scan(&eventCount)
+	require.NoError(t, err)
+	require.Zero(t, eventCount)
+}
+
 type webhookFixture struct {
 	customerID        uuid.UUID
 	activityID        uuid.UUID
@@ -521,7 +571,6 @@ func TestFailedPaymentAttemptCanBeRetriedSuccessfully(t *testing.T) {
 	`, f.paymentID).Scan(&attemptCount)
 	require.NoError(t, err)
 
-	require.Equal(t, 2, attemptCount)
 	require.Equal(t, 2, attemptCount)
 }
 

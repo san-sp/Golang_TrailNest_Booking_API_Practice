@@ -19,9 +19,15 @@ func (r *Repository) ProcessSuccessfulWebhook(
 	eventType string,
 	providerPaymentID string,
 ) error {
-	if provider == "" || eventID == "" ||
-		eventType == "" || providerPaymentID == "" {
+	if provider == "" || eventID == "" || providerPaymentID == "" {
 		return errors.New("invalid webhook event")
+	}
+
+	switch eventType {
+	case "payment.captured", "payment.succeeded", "payment_link.paid":
+		// Supported successful-payment event types.
+	default:
+		return errors.New("unsupported successful payment event type")
 	}
 
 	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{})
