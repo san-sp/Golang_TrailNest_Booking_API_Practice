@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 	"trailnest/internal/activity"
+	"trailnest/internal/booking"
 	"trailnest/internal/reservation"
 
 	"github.com/gin-gonic/gin"
@@ -2324,4 +2325,99 @@ func TestCancellingActivityPreservesFailedRefundJob(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "succeeded", paymentStatus)
 	require.Equal(t, "fulfilled", fulfillmentStatus)
+}
+
+func TestConcurrentBookingCancellationAndDuplicateWebhookStayConsistent(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+
+	f := createWebhookFixture(t, pool)
+	paymentRepo := NewRepository(pool)
+	bookingRepo := booking.NewRepository(pool)
+
+	// First webhook: create a successfully paid, confirmed booking.
+	firstEventID := "event_" + uuid.NewString()
+	err := paymentRepo.ProcessSuccessfulWebhook(
+		ctx,
+		"mock",
+		firstEventID,
+		"payment.succeeded",
+		f.providerPaymentID,
+	)
+	require.NoError(t, err)
+
+	var bookingID uuid.UUID
+	err = pool.QueryRow(ctx, `
+		SELECT id
+		FROM bookings
+		WHERE reservation_id = $1
+		  AND status = 'confirmed'
+	`, f.reservationID).Scan(&bookingID)
+	require.NoError(t, err)
+
+	// Race customer cancellation against a duplicate success notification.
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+
+	go func() {
+		<-start
+		errs <- bookingRepo.Cancel(ctx, f.customerID, bookingID)
+	}()
+
+	go func() {
+		<-start
+		errs <- paymentRepo.ProcessSuccessfulWebhook(
+			ctx,
+			"mock",
+			"event_"+uuid.NewString(),
+			"payment.succeeded",
+			f.providerPaymentID,
+		)
+	}()
+
+	close(start)
+
+	require.NoError(t, <-errs)
+	require.NoError(t, <-errs)
+
+	// Cancellation must win for booking state, regardless of execution order.
+	var bookingStatus string
+	err = pool.QueryRow(ctx, `
+		SELECT status FROM bookings WHERE id = $1
+	`, bookingID).Scan(&bookingStatus)
+	require.NoError(t, err)
+	require.Equal(t, "cancelled", bookingStatus)
+
+	// The captured payment must remain recorded as successful,
+	// with its refund requirement preserved.
+	var paymentStatus, fulfillmentStatus string
+	err = pool.QueryRow(ctx, `
+		SELECT status, fulfillment_status
+		FROM payments
+		WHERE id = $1
+	`, f.paymentID).Scan(&paymentStatus, &fulfillmentStatus)
+	require.NoError(t, err)
+	require.Equal(t, "succeeded", paymentStatus)
+	require.Equal(t, "refund_required", fulfillmentStatus)
+
+	// Exactly one refund job must exist for this payment.
+	var refundCount int
+	err = pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM payment_refunds
+		WHERE payment_id = $1
+	`, f.paymentID).Scan(&refundCount)
+	require.NoError(t, err)
+	require.Equal(t, 1, refundCount)
+
+	// No confirmed booking may remain for the reservation.
+	var confirmedCount int
+	err = pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM bookings
+		WHERE reservation_id = $1
+		  AND status = 'confirmed'
+	`, f.reservationID).Scan(&confirmedCount)
+	require.NoError(t, err)
+	require.Zero(t, confirmedCount)
 }
