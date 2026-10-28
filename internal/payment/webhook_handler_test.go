@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -123,6 +124,38 @@ func TestWebhookHandlerAcknowledgesUnsupportedEvent(t *testing.T) {
 			"expected status %d, got %d",
 			http.StatusOK,
 			recorder.Code,
+		)
+	}
+}
+
+func TestWebhookHandlerRejectsOversizedBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler := NewWebhookHandler(
+		nil,
+		&RazorpayClient{},
+		"test_webhook_secret",
+	)
+
+	router := gin.New()
+	router.POST("/webhooks/razorpay", handler.Handle)
+
+	body := strings.Repeat("a", (1<<20)+1)
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/webhooks/razorpay",
+		strings.NewReader(body),
+	)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf(
+			"expected status %d, got %d; response: %s",
+			http.StatusRequestEntityTooLarge,
+			recorder.Code,
+			recorder.Body.String(),
 		)
 	}
 }

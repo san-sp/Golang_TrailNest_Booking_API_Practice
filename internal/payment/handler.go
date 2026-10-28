@@ -10,6 +10,22 @@ import (
 	"github.com/google/uuid"
 )
 
+const maxPaymentRequestBody = 64 << 10 // 64 KiB
+
+func paymentBodyError(c *gin.Context, err error, message string) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+			"error": "request body exceeds the maximum allowed size",
+		})
+		return
+	}
+
+	c.JSON(http.StatusBadRequest, gin.H{
+		"error": message,
+	})
+}
+
 type Handler struct {
 	service    *CheckoutService
 	repository *Repository
@@ -72,14 +88,12 @@ func (h *Handler) Create(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(
 		c.Writer,
 		c.Request.Body,
-		1<<20,
+		maxPaymentRequestBody,
 	)
 
 	var request createPaymentRequest
 	if err := c.ShouldBindJSON(&request); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "invalid request body",
-		})
+		paymentBodyError(c, err, "invalid request body")
 		return
 	}
 
@@ -151,9 +165,15 @@ func (h *Handler) Verify(c *gin.Context) {
 		return
 	}
 
+	c.Request.Body = http.MaxBytesReader(
+		c.Writer,
+		c.Request.Body,
+		maxPaymentRequestBody,
+	)
+
 	var request verifyPaymentRequest
 	if err := c.ShouldBindJSON(&request); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		paymentBodyError(c, err, "invalid request body")
 		return
 	}
 
@@ -266,8 +286,14 @@ func (h *Handler) AdminReconcileCapturedPayment(c *gin.Context) {
 		RazorpayPaymentID string `json:"razorpay_payment_id" binding:"required"`
 	}
 
+	c.Request.Body = http.MaxBytesReader(
+		c.Writer,
+		c.Request.Body,
+		maxPaymentRequestBody,
+	)
+
 	if err := c.ShouldBindJSON(&request); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "razorpay_payment_id is required"})
+		paymentBodyError(c, err, "razorpay_payment_id is required")
 		return
 	}
 

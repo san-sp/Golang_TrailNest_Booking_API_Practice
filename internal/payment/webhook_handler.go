@@ -70,7 +70,17 @@ func (h *WebhookHandler) Handle(c *gin.Context) {
 
 	rawBody, err := io.ReadAll(c.Request.Body)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid webhook body"})
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+				"error": "webhook body exceeds the maximum allowed size",
+			})
+			return
+		}
+
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "invalid webhook body",
+		})
 		return
 	}
 
