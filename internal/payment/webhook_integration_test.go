@@ -81,8 +81,10 @@ func TestSuccessfulWebhookIsIdempotent(t *testing.T) {
 
 	// A distinct event ID can also report the same successful payment.
 	// It must not create another booking.
+	secondEventID := "event_" + uuid.NewString()
+
 	err = repo.ProcessSuccessfulWebhook(
-		ctx, "mock", eventID, "payment.succeeded", providerPaymentID,
+		ctx, "mock", secondEventID, "payment.succeeded", providerPaymentID,
 	)
 	require.NoError(t, err)
 
