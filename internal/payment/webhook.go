@@ -79,13 +79,17 @@ func (r *Repository) ProcessSuccessfulWebhook(
 
 	// Keep the lock order consistent with checkout:
 	// activity -> reservation -> payment.
+
 	var lockedActivityID uuid.UUID
+	var activityStatus string
+
 	err = tx.QueryRow(ctx, `
-		SELECT id
-		FROM activities
-		WHERE id = $1
-		FOR UPDATE
-	`, activityID).Scan(&lockedActivityID)
+        SELECT id, status
+        FROM activities
+        WHERE id = $1
+        FOR UPDATE
+`, activityID).Scan(&lockedActivityID, &activityStatus)
+
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrReservationNotFound
 	}
@@ -211,7 +215,9 @@ func (r *Repository) ProcessSuccessfulWebhook(
 	// The provider has confirmed that money was captured.
 	// If fulfillment is impossible, record that fact rather than
 	// rolling back the webhook forever.
-	needsRefund := reservationStatus != "pending" || !active
+	needsRefund := reservationStatus != "pending" ||
+		!active ||
+		activityStatus != "published"
 
 	if !needsRefund {
 		var capacity int

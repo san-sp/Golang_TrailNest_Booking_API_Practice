@@ -107,6 +107,18 @@ func TestSuccessfulWebhookIsIdempotent(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, reservationID, savedReservationID)
 
+	var eventCount int
+
+	err = pool.QueryRow(ctx, `
+    SELECT COUNT(*)
+    FROM payment_webhook_events
+    WHERE provider = $1
+      AND provider_event_id IN ($2, $3)
+`, "mock", eventID, secondEventID).Scan(&eventCount)
+
+	require.NoError(t, err)
+	require.Equal(t, 2, eventCount)
+
 	var paymentStatus, fulfillmentStatus, reservationStatus string
 
 	err = pool.QueryRow(ctx, `
@@ -1952,4 +1964,75 @@ func TestSuccessfulPaymentRejectsConflictingRefundJob(t *testing.T) {
 	`, "mock", eventID).Scan(&eventCount)
 	require.NoError(t, err)
 	require.Zero(t, eventCount)
+}
+
+func TestSuccessfulPaymentForCancelledActivityRequiresRefund(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+
+	f := createWebhookFixture(t, pool)
+	repo := NewRepository(pool)
+
+	// The activity is cancelled before the payment webhook arrives.
+	_, err := pool.Exec(ctx, `
+		UPDATE activities
+		SET status = 'cancelled'
+		WHERE id = $1
+	`, f.activityID)
+	require.NoError(t, err)
+
+	eventID := "event_" + uuid.NewString()
+
+	err = repo.ProcessSuccessfulWebhook(
+		ctx,
+		"mock",
+		eventID,
+		"payment.succeeded",
+		f.providerPaymentID,
+	)
+	require.NoError(t, err)
+
+	// The provider captured the money, but the booking cannot be fulfilled.
+	var paymentStatus, fulfillmentStatus string
+	err = pool.QueryRow(ctx, `
+		SELECT status, fulfillment_status
+		FROM payments
+		WHERE id = $1
+	`, f.paymentID).Scan(&paymentStatus, &fulfillmentStatus)
+	require.NoError(t, err)
+	require.Equal(t, "succeeded", paymentStatus)
+	require.Equal(t, "refund_required", fulfillmentStatus)
+
+	// No confirmed booking should exist for a cancelled activity.
+	var bookingCount int
+	err = pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM bookings
+		WHERE reservation_id = $1
+		  AND status = 'confirmed'
+	`, f.reservationID).Scan(&bookingCount)
+	require.NoError(t, err)
+	require.Zero(t, bookingCount)
+
+	// Exactly one pending refund job should be created.
+	var refundCount int
+	err = pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM payment_refunds
+		WHERE payment_id = $1
+		  AND status = 'pending'
+	`, f.paymentID).Scan(&refundCount)
+	require.NoError(t, err)
+	require.Equal(t, 1, refundCount)
+
+	// The successful webhook must be recorded as processed.
+	var eventStatus string
+	err = pool.QueryRow(ctx, `
+		SELECT status
+		FROM payment_webhook_events
+		WHERE provider = $1
+		  AND provider_event_id = $2
+	`, "mock", eventID).Scan(&eventStatus)
+	require.NoError(t, err)
+	require.Equal(t, "processed", eventStatus)
 }
