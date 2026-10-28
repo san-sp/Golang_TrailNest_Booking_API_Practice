@@ -442,6 +442,86 @@ func TestConcurrentPaymentConfirmationsRespectCapacity(t *testing.T) {
 	require.Equal(t, 0, refundRequiredCount)
 }
 
+func TestConcurrentDuplicateFailedPaymentWebhook(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+
+	f := createWebhookFixture(t, pool)
+	repo := NewRepository(pool)
+
+	orderID := "order_" + uuid.NewString()
+	providerPaymentID := "pay_failed_" + uuid.NewString()
+	eventID := "event_failed_" + uuid.NewString()
+
+	_, err := pool.Exec(ctx, `
+		UPDATE payments
+		SET provider = 'razorpay',
+		    provider_payment_id = NULL,
+		    provider_order_id = $2
+		WHERE id = $1
+	`, f.paymentID, orderID)
+	require.NoError(t, err)
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-start
+			errs <- repo.ProcessFailedPaymentAttemptWebhook(
+				ctx,
+				"razorpay",
+				eventID,
+				"payment.failed",
+				f.paymentID,
+				orderID,
+				providerPaymentID,
+				5000,
+				"INR",
+			)
+		}()
+	}
+
+	close(start)
+
+	for i := 0; i < 2; i++ {
+		require.NoError(t, <-errs)
+	}
+
+	var eventCount, attemptCount, bookingCount int
+	var paymentStatus string
+
+	err = pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM payment_webhook_events
+		WHERE provider = 'razorpay'
+		  AND provider_event_id = $1
+	`, eventID).Scan(&eventCount)
+	require.NoError(t, err)
+	require.Equal(t, 1, eventCount)
+
+	err = pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM payment_attempts
+		WHERE provider = 'razorpay'
+		  AND provider_payment_id = $1
+	`, providerPaymentID).Scan(&attemptCount)
+	require.NoError(t, err)
+	require.Equal(t, 1, attemptCount)
+
+	err = pool.QueryRow(ctx, `
+		SELECT status FROM payments WHERE id = $1
+	`, f.paymentID).Scan(&paymentStatus)
+	require.NoError(t, err)
+	require.Equal(t, "pending", paymentStatus)
+
+	err = pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM bookings WHERE reservation_id = $1
+	`, f.reservationID).Scan(&bookingCount)
+	require.NoError(t, err)
+	require.Zero(t, bookingCount)
+}
+
 func TestFailedPaymentAttemptCanBeRetriedSuccessfully(t *testing.T) {
 	pool := openTestPool(t)
 	ctx := context.Background()
