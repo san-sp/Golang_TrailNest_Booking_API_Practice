@@ -451,3 +451,203 @@ func TestUpdateImageURLByOwner(t *testing.T) {
 	)
 	require.ErrorIs(t, err, ErrActivityNotFound)
 }
+
+func TestUpdateDetailsRejectsCapacityBelowOccupiedSpots(t *testing.T) {
+	pool := openActivityTestPool(t)
+	ctx := t.Context()
+
+	ownerID := uuid.New()
+	activityID := uuid.New()
+	customerID := uuid.New()
+	reservationID := uuid.New()
+
+	_, err := pool.Exec(ctx, `
+		INSERT INTO users (id, email, password_hash, role, email_verified)
+		VALUES ($1, $2, 'test-hash', 'customer', TRUE)
+	`, ownerID, uuid.NewString()+"@example.test")
+	require.NoError(t, err)
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO users (id, email, password_hash, role, email_verified)
+		VALUES ($1, $2, 'test-hash', 'customer', TRUE)
+	`, customerID, uuid.NewString()+"@example.test")
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(
+			context.Background(), 5*time.Second,
+		)
+		defer cancel()
+
+		_, err := pool.Exec(cleanupCtx,
+			`DELETE FROM reservations WHERE activity_id = $1`, activityID)
+		if err != nil {
+			t.Errorf("cleanup reservations: %v", err)
+		}
+		_, err = pool.Exec(cleanupCtx,
+			`DELETE FROM bookings WHERE activity_id = $1`, activityID)
+		if err != nil {
+			t.Errorf("cleanup bookings: %v", err)
+		}
+		_, err = pool.Exec(cleanupCtx,
+			`DELETE FROM activities WHERE id = $1`, activityID)
+		if err != nil {
+			t.Errorf("cleanup activity: %v", err)
+		}
+		_, err = pool.Exec(cleanupCtx,
+			`DELETE FROM users WHERE id = ANY($1)`, []uuid.UUID{ownerID, customerID})
+		if err != nil {
+			t.Errorf("cleanup users: %v", err)
+		}
+	})
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO activities (
+			id, owner_id, title, description, location,
+			starts_at, ends_at, capacity, status, price_minor, currency
+		)
+		VALUES (
+			$1, $2, 'Capacity update test', 'Test description', 'Test location',
+			NOW() + INTERVAL '2 days', NOW() + INTERVAL '3 days',
+			10, 'published', 2500, 'INR'
+		)
+	`, activityID, ownerID)
+	require.NoError(t, err)
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO bookings (customer_id, activity_id, quantity, status)
+		VALUES ($1, $2, 4, 'confirmed')
+	`, customerID, activityID)
+	require.NoError(t, err)
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO reservations (
+			id, customer_id, activity_id, quantity, status, expires_at
+		)
+		VALUES ($1, $2, $3, 3, 'pending', NOW() + INTERVAL '1 hour')
+	`, reservationID, customerID, activityID)
+	require.NoError(t, err)
+
+	repo := NewRepository(pool)
+	input := UpdateActivityInput{
+		Title:       "Updated capacity test",
+		Description: "Updated description",
+		Location:    "Updated location",
+		StartsAt:    time.Now().UTC().Add(48 * time.Hour),
+		EndsAt:      time.Now().UTC().Add(72 * time.Hour),
+		Capacity:    6,
+		PriceMinor:  2500,
+		Currency:    "INR",
+	}
+
+	_, err = repo.UpdateDetails(ctx, activityID, input)
+	require.ErrorIs(t, err, ErrCapacityBelowBookings)
+
+	var capacity int
+	err = pool.QueryRow(ctx,
+		`SELECT capacity FROM activities WHERE id = $1`, activityID,
+	).Scan(&capacity)
+	require.NoError(t, err)
+	require.Equal(t, 10, capacity, "rejected update must preserve original capacity")
+}
+
+func TestUpdateDetailsAllowsCapacityAtOccupiedSpotsPlusOne(t *testing.T) {
+	pool := openActivityTestPool(t)
+	ctx := t.Context()
+
+	ownerID := uuid.New()
+	customerID := uuid.New()
+	activityID := uuid.New()
+	reservationID := uuid.New()
+
+	_, err := pool.Exec(ctx, `
+		INSERT INTO users (id, email, password_hash, role, email_verified)
+		VALUES ($1, $2, 'test-hash', 'customer', TRUE)
+	`, ownerID, uuid.NewString()+"@example.test")
+	require.NoError(t, err)
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO users (id, email, password_hash, role, email_verified)
+		VALUES ($1, $2, 'test-hash', 'customer', TRUE)
+	`, customerID, uuid.NewString()+"@example.test")
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(
+			context.Background(), 5*time.Second,
+		)
+		defer cancel()
+
+		_, err := pool.Exec(cleanupCtx,
+			`DELETE FROM reservations WHERE activity_id = $1`, activityID)
+		if err != nil {
+			t.Errorf("cleanup reservations: %v", err)
+		}
+		_, err = pool.Exec(cleanupCtx,
+			`DELETE FROM bookings WHERE activity_id = $1`, activityID)
+		if err != nil {
+			t.Errorf("cleanup bookings: %v", err)
+		}
+		_, err = pool.Exec(cleanupCtx,
+			`DELETE FROM activities WHERE id = $1`, activityID)
+		if err != nil {
+			t.Errorf("cleanup activity: %v", err)
+		}
+		_, err = pool.Exec(cleanupCtx,
+			`DELETE FROM users WHERE id = ANY($1)`, []uuid.UUID{ownerID, customerID})
+		if err != nil {
+			t.Errorf("cleanup users: %v", err)
+		}
+	})
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO activities (
+			id, owner_id, title, description, location,
+			starts_at, ends_at, capacity, status, price_minor, currency
+		)
+		VALUES (
+			$1, $2, 'Capacity update test', 'Test description', 'Test location',
+			NOW() + INTERVAL '2 days', NOW() + INTERVAL '3 days',
+			10, 'published', 2500, 'INR'
+		)
+	`, activityID, ownerID)
+	require.NoError(t, err)
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO bookings (customer_id, activity_id, quantity, status)
+		VALUES ($1, $2, 4, 'confirmed')
+	`, customerID, activityID)
+	require.NoError(t, err)
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO reservations (
+			id, customer_id, activity_id, quantity, status, expires_at
+		)
+		VALUES ($1, $2, $3, 3, 'pending', NOW() + INTERVAL '1 hour')
+	`, reservationID, customerID, activityID)
+	require.NoError(t, err)
+
+	repo := NewRepository(pool)
+	input := UpdateActivityInput{
+		Title:       "Updated capacity test",
+		Description: "Updated description",
+		Location:    "Updated location",
+		StartsAt:    time.Now().UTC().Add(48 * time.Hour),
+		EndsAt:      time.Now().UTC().Add(72 * time.Hour),
+		Capacity:    8,
+		PriceMinor:  2500,
+		Currency:    "INR",
+	}
+
+	updated, err := repo.UpdateDetails(ctx, activityID, input)
+	require.NoError(t, err)
+	require.Equal(t, 8, updated.Capacity)
+	require.Equal(t, 1, updated.RemainingCapacity)
+
+	var persistedCapacity int
+	err = pool.QueryRow(ctx,
+		`SELECT capacity FROM activities WHERE id = $1`, activityID,
+	).Scan(&persistedCapacity)
+	require.NoError(t, err)
+	require.Equal(t, 8, persistedCapacity)
+}
