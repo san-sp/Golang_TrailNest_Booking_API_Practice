@@ -74,10 +74,40 @@ func createBookingActivityFixture(t *testing.T, pool *pgxpool.Pool, status strin
 		)
 		defer cancel()
 
-		// Delete child records before their referenced activity.
+		// Delete dependent payment/refund records before their parent rows.
 		_, err := pool.Exec(
 			cleanupCtx,
+			`DELETE FROM payment_refunds
+			 WHERE payment_id IN (
+			   SELECT p.id
+			   FROM payments p
+			   JOIN reservations r ON r.id = p.reservation_id
+			   WHERE r.activity_id = $1
+			 )`,
+			activityID,
+		)
+		require.NoError(t, err)
+
+		_, err = pool.Exec(
+			cleanupCtx,
+			`DELETE FROM payments
+			 WHERE reservation_id IN (
+			   SELECT id FROM reservations WHERE activity_id = $1
+			 )`,
+			activityID,
+		)
+		require.NoError(t, err)
+
+		_, err = pool.Exec(
+			cleanupCtx,
 			`DELETE FROM bookings WHERE activity_id = $1`,
+			activityID,
+		)
+		require.NoError(t, err)
+
+		_, err = pool.Exec(
+			cleanupCtx,
+			`DELETE FROM reservations WHERE activity_id = $1`,
 			activityID,
 		)
 		require.NoError(t, err)
@@ -421,6 +451,72 @@ func TestCancelBookingSuccessfully(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, "cancelled", status)
+}
+
+func TestCancelPaidBookingCreatesRefundJob(t *testing.T) {
+	pool := openBookingTestPool(t)
+	repo := NewRepository(pool)
+
+	customerID, activityID := createBookingActivityFixture(t, pool, "published")
+	ctx := t.Context()
+
+	reservationID := uuid.New()
+	paymentID := uuid.New()
+	bookingID := uuid.New()
+
+	_, err := pool.Exec(ctx, `
+		INSERT INTO reservations (
+			id, customer_id, activity_id, quantity, status, expires_at
+		)
+		VALUES ($1, $2, $3, 1, 'confirmed', NOW() + INTERVAL '1 day')
+	`, reservationID, customerID, activityID)
+	require.NoError(t, err)
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO payments (
+			id, reservation_id, customer_id, amount_minor, currency,
+			status, fulfillment_status, provider, provider_payment_id, idempotency_key
+		)
+		VALUES ($1, $2, $3, 2500, 'INR', 'succeeded', 'fulfilled',
+		        'test-provider', $4, $5)
+	`, paymentID, reservationID, customerID, "provider-payment-"+paymentID.String(), "test-key-"+paymentID.String())
+	require.NoError(t, err)
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO bookings (
+			id, customer_id, activity_id, reservation_id, quantity, status
+		)
+		VALUES ($1, $2, $3, $4, 1, 'confirmed')
+	`, bookingID, customerID, activityID, reservationID)
+	require.NoError(t, err)
+
+	require.NoError(t, repo.Cancel(ctx, customerID, bookingID))
+
+	var bookingStatus string
+	err = pool.QueryRow(ctx, `SELECT status FROM bookings WHERE id = $1`, bookingID).Scan(&bookingStatus)
+	require.NoError(t, err)
+	require.Equal(t, "cancelled", bookingStatus)
+
+	var refundCount int
+	err = pool.QueryRow(ctx, `SELECT COUNT(*) FROM payment_refunds WHERE payment_id = $1`, paymentID).Scan(&refundCount)
+	require.NoError(t, err)
+	require.Equal(t, 1, refundCount)
+
+	var refundStatus string
+	var idempotencyKey string
+	err = pool.QueryRow(ctx, `
+		SELECT status, idempotency_key
+		FROM payment_refunds
+		WHERE payment_id = $1
+	`, paymentID).Scan(&refundStatus, &idempotencyKey)
+	require.NoError(t, err)
+	require.Equal(t, "pending", refundStatus)
+	require.Equal(t, "trailnest-refund-"+paymentID.String(), idempotencyKey)
+
+	var fulfillmentStatus string
+	err = pool.QueryRow(ctx, `SELECT fulfillment_status FROM payments WHERE id = $1`, paymentID).Scan(&fulfillmentStatus)
+	require.NoError(t, err)
+	require.Equal(t, "refund_required", fulfillmentStatus)
 }
 
 func TestCancelBookingTwiceReturnsError(t *testing.T) {

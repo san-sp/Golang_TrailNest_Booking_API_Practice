@@ -153,13 +153,18 @@ func (r *Repository) Cancel(
 		_ = tx.Rollback(ctx)
 	}()
 
-	// Find the activity without locking the booking row first.
+	// Find the activity and optional reservation without locking the booking
+	// row first. The activity lock serializes cancellation with payment webhooks
+	// and activity cancellation, which use the same lock order.
 	var activityID uuid.UUID
+	var reservationID uuid.UUID
 	err = tx.QueryRow(ctx, `
-		SELECT activity_id
+		SELECT
+			activity_id,
+			COALESCE(reservation_id, '00000000-0000-0000-0000-000000000000'::uuid)
 		FROM bookings
 		WHERE id = $1 AND customer_id = $2
-	`, bookingID, customerID).Scan(&activityID)
+	`, bookingID, customerID).Scan(&activityID, &reservationID)
 
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrBookingNotFound
@@ -185,6 +190,22 @@ func (r *Repository) Cancel(
 		return fmt.Errorf("lock activity: %w", err)
 	}
 
+	if reservationID != uuid.Nil {
+		var reservationStatus string
+		err = tx.QueryRow(ctx, `
+			SELECT status
+			FROM reservations
+			WHERE id = $1
+			FOR UPDATE
+		`, reservationID).Scan(&reservationStatus)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrBookingNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock booking reservation: %w", err)
+		}
+	}
+
 	var status string
 	err = tx.QueryRow(ctx, `
 		SELECT status
@@ -206,6 +227,128 @@ func (r *Repository) Cancel(
 
 	if !time.Now().Before(startsAt.Add(-24 * time.Hour)) {
 		return ErrCancellationDeadlinePassed
+	}
+
+	// Keep the shared payment workflow lock order:
+	// activity -> reservation -> booking -> payment.
+	if reservationID != uuid.Nil {
+		type paymentForRefund struct {
+			id                uuid.UUID
+			status            string
+			fulfillmentStatus string
+			provider          string
+			providerPaymentID string
+			amountMinor       int64
+			currency          string
+		}
+		rows, queryErr := tx.Query(ctx, `
+			SELECT
+				id, status, fulfillment_status, provider,
+				COALESCE(provider_payment_id, ''), amount_minor, currency
+			FROM payments
+			WHERE reservation_id = $1
+			ORDER BY id
+			FOR UPDATE
+		`, reservationID)
+		if queryErr != nil {
+			return fmt.Errorf("lock booking payments: %w", queryErr)
+		}
+
+		payments := make([]paymentForRefund, 0, 1)
+		for rows.Next() {
+			var p paymentForRefund
+			if scanErr := rows.Scan(
+				&p.id, &p.status, &p.fulfillmentStatus, &p.provider,
+				&p.providerPaymentID, &p.amountMinor, &p.currency,
+			); scanErr != nil {
+				rows.Close()
+				return fmt.Errorf("scan booking payment: %w", scanErr)
+			}
+			payments = append(payments, p)
+		}
+		if rowsErr := rows.Err(); rowsErr != nil {
+			rows.Close()
+			return fmt.Errorf("iterate booking payments: %w", rowsErr)
+		}
+		rows.Close()
+
+		for _, p := range payments {
+			// Only a successfully captured and fulfilled payment is eligible
+			// for a customer-cancellation refund.
+			if p.status != "succeeded" || p.fulfillmentStatus != "fulfilled" {
+				continue
+			}
+			if p.providerPaymentID == "" {
+				return fmt.Errorf(
+					"payment %s is fulfilled but has no provider payment ID",
+					p.id,
+				)
+			}
+
+			idempotencyKey := "trailnest-refund-" + p.id.String()
+			_, err = tx.Exec(ctx, `
+				INSERT INTO payment_refunds (
+					payment_id, provider, provider_payment_id,
+					idempotency_key, amount_minor, currency, status
+				)
+				VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+				ON CONFLICT (payment_id) DO NOTHING
+			`, p.id, p.provider, p.providerPaymentID, idempotencyKey, p.amountMinor, p.currency)
+			if err != nil {
+				return fmt.Errorf("create refund job for payment %s: %w", p.id, err)
+			}
+
+			var existingProvider, existingProviderPaymentID, existingKey string
+			var existingAmount int64
+			var existingCurrency, refundStatus string
+			err = tx.QueryRow(ctx, `
+				SELECT provider, provider_payment_id, idempotency_key,
+				       amount_minor, currency, status
+				FROM payment_refunds
+				WHERE payment_id = $1
+				FOR UPDATE
+			`, p.id).Scan(
+				&existingProvider, &existingProviderPaymentID, &existingKey,
+				&existingAmount, &existingCurrency, &refundStatus,
+			)
+			if err != nil {
+				return fmt.Errorf("verify refund job for payment %s: %w", p.id, err)
+			}
+			if existingProvider != p.provider ||
+				existingProviderPaymentID != p.providerPaymentID ||
+				existingKey != idempotencyKey ||
+				existingAmount != p.amountMinor ||
+				existingCurrency != p.currency {
+				return fmt.Errorf(
+					"existing refund job for payment %s does not match the expected refund",
+					p.id,
+				)
+			}
+
+			var fulfillmentStatus string
+			switch refundStatus {
+			case "pending", "processing":
+				fulfillmentStatus = "refund_required"
+			case "review_required":
+				fulfillmentStatus = "review_required"
+			case "succeeded":
+				fulfillmentStatus = "refunded"
+			case "failed":
+				// Keep failed jobs visible for explicit recovery. Do not
+				// enqueue another refund or mark the payment as refunded.
+				continue
+			default:
+				return fmt.Errorf("unexpected refund status %q for payment %s", refundStatus, p.id)
+			}
+			_, err = tx.Exec(ctx, `
+				UPDATE payments
+				SET fulfillment_status = $2, updated_at = NOW()
+				WHERE id = $1
+			`, p.id, fulfillmentStatus)
+			if err != nil {
+				return fmt.Errorf("update payment refund state for %s: %w", p.id, err)
+			}
+		}
 	}
 
 	_, err = tx.Exec(ctx, `
