@@ -1043,3 +1043,64 @@ func TestListAllAdminRespectsLimitAndOffset(t *testing.T) {
 		)
 	}
 }
+
+func TestRepeatedCancellationDoesNotReleaseCapacityTwice(t *testing.T) {
+	pool := openBookingTestPool(t)
+	repo := NewRepository(pool)
+
+	customerID, activityID := createBookingActivityFixture(
+		t,
+		pool,
+		"published",
+	)
+
+	makeActivityFree(t, pool, activityID)
+
+	// The activity has capacity 10. Book all 10 spots.
+	firstBooking, err := repo.Create(
+		t.Context(),
+		customerID,
+		activityID,
+		10,
+	)
+	require.NoError(t, err)
+	require.Equal(t, "confirmed", firstBooking.Status)
+
+	// The first cancellation must succeed.
+	err = repo.Cancel(t.Context(), customerID, firstBooking.ID)
+	require.NoError(t, err)
+
+	// A repeated cancellation must be rejected.
+	err = repo.Cancel(t.Context(), customerID, firstBooking.ID)
+	require.ErrorIs(t, err, ErrBookingAlreadyCancelled)
+
+	// All 10 spots should now be available for another booking.
+	secondBooking, err := repo.Create(
+		t.Context(),
+		customerID,
+		activityID,
+		10,
+	)
+	require.NoError(t, err)
+	require.Equal(t, "confirmed", secondBooking.Status)
+
+	// Verify the final database state, not just the returned errors.
+	var cancelledCount int
+	err = pool.QueryRow(t.Context(), `
+		SELECT COUNT(*)
+		FROM bookings
+		WHERE id = $1 AND status = 'cancelled'
+	`, firstBooking.ID).Scan(&cancelledCount)
+	require.NoError(t, err)
+	require.Equal(t, 1, cancelledCount)
+
+	var confirmedQuantity int
+	err = pool.QueryRow(t.Context(), `
+		SELECT COALESCE(SUM(quantity), 0)::INTEGER
+		FROM bookings
+		WHERE activity_id = $1
+		  AND status = 'confirmed'
+	`, activityID).Scan(&confirmedQuantity)
+	require.NoError(t, err)
+	require.Equal(t, 10, confirmedQuantity)
+}
