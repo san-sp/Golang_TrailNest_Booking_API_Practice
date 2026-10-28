@@ -95,6 +95,7 @@ func main() {
 
 	loginLimiter := middleware.NewRateLimiter(10, time.Minute)
 	emailLimiter := middleware.NewRateLimiter(5, time.Minute)
+	registerLimiter := middleware.NewRateLimiter(5, time.Minute)
 
 	// Share the existing PostgreSQL pool with the user repository.
 	userRepository := user.NewRepository(pool)
@@ -237,8 +238,10 @@ func main() {
 	admin.PATCH("/users/:userID/role", adminUserHandler.PromoteToOperator)
 	admin.POST("/payments/:paymentID/reconcile", paymentHandler.AdminReconcileCapturedPayment)
 
-	router.POST("/api/v1/auth/register", middleware.MaxBodyBytes(1<<20),
-		registerHandler.Register)
+	router.POST("/api/v1/auth/register", registerLimiter.Middleware(),
+		middleware.MaxBodyBytes(1<<20),
+		registerHandler.Register,
+	)
 	router.POST("/api/v1/auth/login", loginLimiter.Middleware(), loginHandler.Login)
 	router.GET("/api/v1/auth/verify-email", emailVerificationHandler.VerifyEmail)
 	router.POST("/api/v1/auth/resend-verification", emailLimiter.Middleware(),
