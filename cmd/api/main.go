@@ -33,8 +33,11 @@ func main() {
 	slog.SetDefault(logger)
 
 	if err := godotenv.Load(); err != nil {
-		slog.Error("load .env file", "error", err)
-		os.Exit(1)
+		if errors.Is(err, os.ErrNotExist) {
+			slog.Info("no .env file found; using environment variables")
+		} else {
+			slog.Warn("could not load .env file; using environment variables", "error", err)
+		}
 	}
 
 	cfg, err := config.Load()
