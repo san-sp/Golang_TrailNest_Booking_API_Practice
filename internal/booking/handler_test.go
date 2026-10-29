@@ -265,3 +265,25 @@ func TestAdminGetByIDRejectsInvalidBookingID(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, recorder.Code)
 	require.Contains(t, recorder.Body.String(), "INVALID_BOOKING_ID")
 }
+
+func TestCreateRejectsOversizedRequestBody(t *testing.T) {
+	handler := NewHandler(nil)
+	router := newBookingTestRouter(handler)
+
+	body := `{"activity_id":"550e8400-e29b-41d4-a716-446655440000","quantity":1,"extra":"` +
+		strings.Repeat("x", int(maxBookingRequestBody)) +
+		`"}`
+
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/bookings",
+		strings.NewReader(body),
+	)
+	request.Header.Set("Content-Type", "application/json")
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusRequestEntityTooLarge, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "REQUEST_TOO_LARGE")
+}

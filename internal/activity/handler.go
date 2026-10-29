@@ -183,8 +183,13 @@ func (h *Handler) AdminCreate(c *gin.Context) {
 		Currency    string `json:"currency"`
 	}
 
-	if err := c.ShouldBindJSON(&input); err != nil {
-		response.Error(c, http.StatusBadRequest, "INVALID_BODY", "Invalid activity payload.", nil)
+	if err := bindActivityJSON(c, &input); err != nil {
+		respondActivityBodyError(
+			c,
+			err,
+			"INVALID_BODY",
+			"Invalid activity payload.",
+		)
 		return
 	}
 
@@ -317,8 +322,13 @@ func (h *Handler) AdminUpdate(c *gin.Context) {
 		Currency    string `json:"currency"`
 	}
 
-	if err := c.ShouldBindJSON(&input); err != nil {
-		response.Error(c, http.StatusBadRequest, "INVALID_BODY", "Invalid activity payload.", nil)
+	if err := bindActivityJSON(c, &input); err != nil {
+		respondActivityBodyError(
+			c,
+			err,
+			"INVALID_BODY",
+			"Invalid activity payload.",
+		)
 		return
 	}
 
@@ -390,8 +400,13 @@ func (h *Handler) AdminChangeStatus(c *gin.Context) {
 		Status string `json:"status"`
 	}
 
-	if err := c.ShouldBindJSON(&input); err != nil {
-		response.Error(c, http.StatusBadRequest, "INVALID_BODY", "Invalid status payload.", nil)
+	if err := bindActivityJSON(c, &input); err != nil {
+		respondActivityBodyError(
+			c,
+			err,
+			"INVALID_BODY",
+			"Invalid status payload.",
+		)
 		return
 	}
 

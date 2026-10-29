@@ -23,6 +23,8 @@ type addWishlistRequest struct {
 	ActivityID string `json:"activity_id"`
 }
 
+const maxWishlistRequestBody int64 = 64 << 10 // 64 KiB
+
 func customerIDFromContext(c *gin.Context) (uuid.UUID, bool) {
 	value, exists := c.Get("user_id")
 	if !exists {
@@ -43,10 +45,34 @@ func customerIDFromContext(c *gin.Context) (uuid.UUID, bool) {
 }
 
 func (h *Handler) Add(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(
+		c.Writer,
+		c.Request.Body,
+		maxWishlistRequestBody,
+	)
+
 	var input addWishlistRequest
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.Error(c, http.StatusBadRequest, "INVALID_REQUEST", "Invalid wishlist request.", nil)
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			response.Error(
+				c,
+				http.StatusRequestEntityTooLarge,
+				"REQUEST_TOO_LARGE",
+				"Request body exceeds the maximum allowed size.",
+				nil,
+			)
+			return
+		}
+
+		response.Error(
+			c,
+			http.StatusBadRequest,
+			"INVALID_REQUEST",
+			"Invalid wishlist request.",
+			nil,
+		)
 		return
 	}
 

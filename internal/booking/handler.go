@@ -25,10 +25,30 @@ type createBookingRequest struct {
 	Quantity   int    `json:"quantity"`
 }
 
+const maxBookingRequestBody int64 = 64 << 10
+
 func (h *Handler) Create(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(
+		c.Writer,
+		c.Request.Body,
+		maxBookingRequestBody,
+	)
+
 	var input createBookingRequest
 
 	if err := c.ShouldBindJSON(&input); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			response.Error(
+				c,
+				http.StatusRequestEntityTooLarge,
+				"REQUEST_TOO_LARGE",
+				"Request body exceeds the maximum allowed size.",
+				nil,
+			)
+			return
+		}
+
 		response.Error(
 			c,
 			http.StatusBadRequest,
