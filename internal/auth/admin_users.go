@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"trailnest/internal/pagination"
 	"trailnest/internal/user"
 )
 
@@ -24,8 +25,8 @@ func (h *AdminUserHandler) List(c *gin.Context) {
 	limit := 20
 
 	if value := c.Query("page"); value != "" {
-		parsed, err := strconv.Atoi(value)
-		if err != nil || parsed < 1 {
+		parsed, ok := pagination.ParsePage(value)
+		if !ok {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error": "invalid page",
 			})

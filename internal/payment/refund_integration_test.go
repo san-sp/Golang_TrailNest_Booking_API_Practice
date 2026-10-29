@@ -180,22 +180,27 @@ func TestClaimRefundJobConcurrentWorkers(t *testing.T) {
 	})
 
 	start := make(chan struct{})
+
 	type result struct {
 		job RefundJob
 		err error
 	}
+
 	results := make(chan result, 2)
+	jobIDs := []uuid.UUID{id1, id2}
 
 	var wg sync.WaitGroup
-	for i := 0; i < 2; i++ {
+
+	for _, jobID := range jobIDs {
 		wg.Add(1)
-		go func() {
+
+		go func(jobID uuid.UUID) {
 			defer wg.Done()
 			<-start
 
-			job, err := repo.ClaimRefundJob(ctx)
+			job, err := repo.claimRefundJob(ctx, &jobID)
 			results <- result{job: job, err: err}
-		}()
+		}(jobID)
 	}
 
 	close(start)
@@ -203,6 +208,7 @@ func TestClaimRefundJobConcurrentWorkers(t *testing.T) {
 	close(results)
 
 	claimed := make(map[uuid.UUID]bool)
+
 	for result := range results {
 		require.NoError(t, result.err)
 		claimed[result.job.ID] = true

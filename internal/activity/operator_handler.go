@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"trailnest/internal/http/response"
+	"trailnest/internal/pagination"
 )
 
 func authenticatedOperatorID(c *gin.Context) (uuid.UUID, bool) {
@@ -123,10 +124,15 @@ func (h *Handler) OperatorList(c *gin.Context) {
 	page, limit := 1, 20
 
 	if value := c.Query("page"); value != "" {
-		parsed, err := strconv.Atoi(value)
-		if err != nil || parsed < 1 {
-			response.Error(c, http.StatusBadRequest, "INVALID_PAGE",
-				"Page must be a positive integer.", nil)
+		parsed, ok := pagination.ParsePage(value)
+		if !ok {
+			response.Error(
+				c,
+				http.StatusBadRequest,
+				"INVALID_PAGE",
+				"Page must be between 1 and 1000000.",
+				nil,
+			)
 			return
 		}
 		page = parsed

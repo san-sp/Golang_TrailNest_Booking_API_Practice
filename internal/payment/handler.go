@@ -8,6 +8,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+
+	"trailnest/internal/pagination"
 )
 
 const maxPaymentRequestBody = 64 << 10 // 64 KiB
@@ -211,9 +213,11 @@ func (h *Handler) AdminList(c *gin.Context) {
 	limit := 20
 
 	if value := c.Query("page"); value != "" {
-		parsed, err := strconv.Atoi(value)
-		if err != nil || parsed < 1 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid page"})
+		parsed, ok := pagination.ParsePage(value)
+		if !ok {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "invalid page",
+			})
 			return
 		}
 		page = parsed

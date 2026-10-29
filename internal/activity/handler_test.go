@@ -49,6 +49,8 @@ func TestListRejectsInvalidPage(t *testing.T) {
 		{name: "zero", page: "0"},
 		{name: "negative", page: "-1"},
 		{name: "not an integer", page: "abc"},
+		{name: "integer overflow", page: "999999999999999999999999999999"},
+		{name: "above maximum", page: "1000001"},
 	}
 
 	for _, tc := range testCases {

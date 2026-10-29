@@ -106,3 +106,28 @@ func TestAdminUserRoutesRejectMissingAuthentication(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, rec.Code)
 	require.Contains(t, rec.Body.String(), "UNAUTHORIZED")
 }
+
+func TestAdminUserListRejectsOversizedPageValues(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	router := gin.New()
+	router.GET("/admin/users", NewAdminUserHandler(nil).List)
+
+	for _, page := range []string{
+		"1000001",
+		"999999999999999999999999999999",
+	} {
+		t.Run(page, func(t *testing.T) {
+			req := httptest.NewRequest(
+				http.MethodGet,
+				"/admin/users?page="+page,
+				nil,
+			)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			require.Equal(t, http.StatusBadRequest, rec.Code)
+			require.Contains(t, rec.Body.String(), "invalid page")
+		})
+	}
+}
