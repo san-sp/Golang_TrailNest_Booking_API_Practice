@@ -236,6 +236,17 @@ func TestCreateRejectsBookingOverCapacity(t *testing.T) {
 	)
 
 	require.ErrorIs(t, err, ErrInsufficientCapacity)
+
+	var bookingCount int
+	err = pool.QueryRow(
+		t.Context(),
+		`SELECT COUNT(*) FROM bookings WHERE activity_id = $1`,
+		activityID,
+	).Scan(&bookingCount)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, bookingCount,
+		"rejected booking must not create an additional booking row")
 }
 
 func TestCreateRejectsPaidActivityWithoutPayment(t *testing.T) {
