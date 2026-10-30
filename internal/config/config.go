@@ -24,6 +24,7 @@ type Config struct {
 	S3Bucket              string
 	AWSRegion             string
 	TrustedProxies        []string
+	AllowedOrigins        []string
 }
 
 func Load() (Config, error) {
@@ -91,6 +92,22 @@ func Load() (Config, error) {
 		}
 	}
 
+	var allowedOrigins []string
+
+	for _, origin := range strings.Split(
+		os.Getenv("CORS_ALLOWED_ORIGINS"),
+		",",
+	) {
+		origin = strings.TrimSpace(origin)
+		if origin != "" {
+			allowedOrigins = append(allowedOrigins, origin)
+		}
+	}
+
+	if len(allowedOrigins) == 0 {
+		allowedOrigins = []string{"http://localhost:8090"}
+	}
+
 	imageStorageDriver := strings.TrimSpace(
 		os.Getenv("IMAGE_STORAGE_DRIVER"),
 	)
@@ -149,5 +166,6 @@ func Load() (Config, error) {
 		S3Bucket:              s3Bucket,
 		AWSRegion:             awsRegion,
 		TrustedProxies:        trustedProxies,
+		AllowedOrigins:        allowedOrigins,
 	}, nil
 }

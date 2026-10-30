@@ -73,6 +73,72 @@ func TestLoadTrustedProxies(t *testing.T) {
 	}
 }
 
+func TestLoadAllowedOrigins(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  []string
+	}{
+		{
+			name:  "defaults to localhost",
+			value: "",
+			want:  []string{"http://localhost:8090"},
+		},
+		{
+			name:  "single origin",
+			value: "https://sansp.in",
+			want:  []string{"https://sansp.in"},
+		},
+		{
+			name:  "multiple origins with whitespace",
+			value: " https://sansp.in, https://www.sansp.in ",
+			want: []string{
+				"https://sansp.in",
+				"https://www.sansp.in",
+			},
+		},
+		{
+			name:  "empty entries are ignored",
+			value: "https://sansp.in,, ,https://www.sansp.in,",
+			want: []string{
+				"https://sansp.in",
+				"https://www.sansp.in",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setRequiredConfigEnv(t)
+			t.Setenv("CORS_ALLOWED_ORIGINS", tt.value)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+
+			if len(cfg.AllowedOrigins) != len(tt.want) {
+				t.Fatalf(
+					"AllowedOrigins = %#v, want %#v",
+					cfg.AllowedOrigins,
+					tt.want,
+				)
+			}
+
+			for i := range tt.want {
+				if cfg.AllowedOrigins[i] != tt.want[i] {
+					t.Errorf(
+						"AllowedOrigins[%d] = %q, want %q",
+						i,
+						cfg.AllowedOrigins[i],
+						tt.want[i],
+					)
+				}
+			}
+		})
+	}
+}
+
 func TestLoadImageStorageConfig(t *testing.T) {
 	tests := []struct {
 		name       string

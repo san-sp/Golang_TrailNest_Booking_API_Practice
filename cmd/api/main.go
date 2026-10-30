@@ -73,9 +73,7 @@ func main() {
 	}
 
 	router.Use(cors.New(cors.Config{
-		AllowOrigins: []string{
-			"http://localhost:8090",
-		},
+		AllowOrigins: cfg.AllowedOrigins,
 		AllowMethods: []string{
 			http.MethodGet,
 			http.MethodPost,
