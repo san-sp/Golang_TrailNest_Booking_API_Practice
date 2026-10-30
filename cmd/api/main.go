@@ -28,6 +28,8 @@ import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -62,6 +64,9 @@ func main() {
 	gin.SetMode(cfg.GinMode)
 
 	router := gin.New()
+
+	metricsRegistry := prometheus.NewRegistry()
+	apiMetrics := middleware.NewMetrics(metricsRegistry)
 
 	if err := router.SetTrustedProxies(cfg.TrustedProxies); err != nil {
 		log.Fatalf("configure trusted proxies: %v", err)
@@ -98,6 +103,7 @@ func main() {
 	// Assign the request ID before logging and handling the request.
 	router.Use(
 		middleware.RequestID(),
+		apiMetrics.Middleware(),
 		gin.Logger(),
 		gin.Recovery(),
 	)
@@ -330,6 +336,13 @@ func main() {
 			"status": "ready",
 		})
 	})
+
+	router.GET("/metrics", gin.WrapH(
+		promhttp.HandlerFor(
+			metricsRegistry,
+			promhttp.HandlerOpts{},
+		),
+	))
 
 	server := &http.Server{
 		Addr:              ":" + cfg.Port,

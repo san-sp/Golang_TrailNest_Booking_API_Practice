@@ -95,3 +95,6 @@ jobs:
 
       - name: Run complete Go test suite
         run: go test ./... -count=1
+
+      - name: Run Go tests with race detector
+        run: go test -race ./... -count=1
