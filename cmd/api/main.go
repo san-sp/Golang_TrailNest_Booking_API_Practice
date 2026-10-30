@@ -23,6 +23,8 @@ import (
 	"trailnest/internal/user"
 	"trailnest/internal/wishlist"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
@@ -86,10 +88,12 @@ func main() {
 
 	router.Use(middleware.SecurityHeaders())
 
-	router.Static(
-		cfg.ImageStoragePublicURL,
-		cfg.ImageStorageDirectory,
-	)
+	if cfg.ImageStorageDriver == "local" {
+		router.Static(
+			cfg.ImageStoragePublicURL,
+			cfg.ImageStorageDirectory,
+		)
+	}
 
 	// Assign the request ID before logging and handling the request.
 	router.Use(
@@ -143,12 +147,59 @@ func main() {
 
 	activityRepository := activity.NewRepository(pool)
 
-	imageStorage, err := storage.NewLocalImageStorage(
-		cfg.ImageStorageDirectory,
-		cfg.ImageStoragePublicURL,
-	)
-	if err != nil {
-		slog.Error("initialize image storage", "error", err)
+	var imageStorage activity.ImageStorage
+
+	switch cfg.ImageStorageDriver {
+	case "local":
+		imageStorage, err = storage.NewLocalImageStorage(
+			cfg.ImageStorageDirectory,
+			cfg.ImageStoragePublicURL,
+		)
+		if err != nil {
+			slog.Error("initialize local image storage", "error", err)
+			os.Exit(1)
+		}
+
+		slog.Info("initialized local image storage")
+
+	case "s3":
+		awsCtx, cancelAWS := context.WithTimeout(
+			context.Background(),
+			10*time.Second,
+		)
+
+		awsCfg, awsErr := awsconfig.LoadDefaultConfig(
+			awsCtx,
+			awsconfig.WithRegion(cfg.AWSRegion),
+		)
+
+		cancelAWS()
+
+		if awsErr != nil {
+			slog.Error("load AWS configuration", "error", awsErr)
+			os.Exit(1)
+		}
+
+		s3Client := s3.NewFromConfig(awsCfg)
+
+		imageStorage, err = storage.NewS3ImageStorage(
+			s3Client,
+			cfg.S3Bucket,
+			cfg.ImageStoragePublicURL,
+		)
+		if err != nil {
+			slog.Error("initialize S3 image storage", "error", err)
+			os.Exit(1)
+		}
+
+		slog.Info(
+			"initialized S3 image storage",
+			"bucket", cfg.S3Bucket,
+			"region", cfg.AWSRegion,
+		)
+
+	default:
+		slog.Error("unsupported image storage driver")
 		os.Exit(1)
 	}
 

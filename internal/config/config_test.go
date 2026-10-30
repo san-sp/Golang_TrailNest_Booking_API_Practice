@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -67,6 +68,111 @@ func TestLoadTrustedProxies(t *testing.T) {
 						tt.want[i],
 					)
 				}
+			}
+		})
+	}
+}
+
+func TestLoadImageStorageConfig(t *testing.T) {
+	tests := []struct {
+		name       string
+		driver     string
+		bucket     string
+		region     string
+		publicURL  string
+		wantDriver string
+		wantError  string
+	}{
+		{
+			name:       "defaults to local storage",
+			wantDriver: "local",
+		},
+		{
+			name:       "accepts local storage",
+			driver:     "local",
+			wantDriver: "local",
+		},
+		{
+			name:       "accepts valid S3 configuration",
+			driver:     "s3",
+			bucket:     "trailnest-images",
+			region:     "ap-south-1",
+			publicURL:  "https://cdn.example.com/activities",
+			wantDriver: "s3",
+		},
+		{
+			name:      "rejects unsupported driver",
+			driver:    "azure",
+			wantError: "IMAGE_STORAGE_DRIVER must be local or s3",
+		},
+		{
+			name:      "requires S3 bucket",
+			driver:    "s3",
+			region:    "ap-south-1",
+			publicURL: "https://cdn.example.com",
+			wantError: "S3_BUCKET is required",
+		},
+		{
+			name:      "requires AWS region",
+			driver:    "s3",
+			bucket:    "trailnest-images",
+			publicURL: "https://cdn.example.com",
+			wantError: "AWS_REGION is required",
+		},
+		{
+			name:      "requires public URL",
+			driver:    "s3",
+			bucket:    "trailnest-images",
+			region:    "ap-south-1",
+			wantError: "IMAGE_STORAGE_PUBLIC_URL is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setRequiredConfigEnv(t)
+
+			t.Setenv("IMAGE_STORAGE_DRIVER", tt.driver)
+			t.Setenv("S3_BUCKET", tt.bucket)
+			t.Setenv("AWS_REGION", tt.region)
+			t.Setenv("IMAGE_STORAGE_PUBLIC_URL", tt.publicURL)
+
+			cfg, err := Load()
+
+			if tt.wantError != "" {
+				if err == nil {
+					t.Fatal("Load() expected an error")
+				}
+
+				if !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf(
+						"Load() error = %q, want it to contain %q",
+						err.Error(),
+						tt.wantError,
+					)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+
+			if cfg.ImageStorageDriver != tt.wantDriver {
+				t.Errorf(
+					"ImageStorageDriver = %q, want %q",
+					cfg.ImageStorageDriver,
+					tt.wantDriver,
+				)
+			}
+
+			if cfg.S3Bucket != tt.bucket {
+				t.Errorf("S3Bucket = %q, want %q", cfg.S3Bucket, tt.bucket)
+			}
+
+			if cfg.AWSRegion != tt.region {
+				t.Errorf("AWSRegion = %q, want %q", cfg.AWSRegion, tt.region)
 			}
 		})
 	}

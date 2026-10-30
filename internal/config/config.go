@@ -20,6 +20,9 @@ type Config struct {
 	RazorpayWebhookSecret string
 	ImageStorageDirectory string
 	ImageStoragePublicURL string
+	ImageStorageDriver    string
+	S3Bucket              string
+	AWSRegion             string
 	TrustedProxies        []string
 }
 
@@ -75,9 +78,6 @@ func Load() (Config, error) {
 		strings.TrimSpace(os.Getenv("IMAGE_STORAGE_PUBLIC_URL")),
 		"/",
 	)
-	if imageStoragePublicURL == "" {
-		imageStoragePublicURL = "/uploads/activities"
-	}
 
 	var trustedProxies []string
 
@@ -89,6 +89,47 @@ func Load() (Config, error) {
 		if proxy != "" {
 			trustedProxies = append(trustedProxies, proxy)
 		}
+	}
+
+	imageStorageDriver := strings.TrimSpace(
+		os.Getenv("IMAGE_STORAGE_DRIVER"),
+	)
+	if imageStorageDriver == "" {
+		imageStorageDriver = "local"
+	}
+
+	if imageStorageDriver != "local" && imageStorageDriver != "s3" {
+		return Config{}, fmt.Errorf(
+			"IMAGE_STORAGE_DRIVER must be local or s3",
+		)
+	}
+
+	s3Bucket := strings.TrimSpace(os.Getenv("S3_BUCKET"))
+	awsRegion := strings.TrimSpace(os.Getenv("AWS_REGION"))
+
+	if imageStorageDriver == "s3" {
+		if s3Bucket == "" {
+			return Config{}, fmt.Errorf(
+				"S3_BUCKET is required when IMAGE_STORAGE_DRIVER=s3",
+			)
+		}
+
+		if awsRegion == "" {
+			return Config{}, fmt.Errorf(
+				"AWS_REGION is required when IMAGE_STORAGE_DRIVER=s3",
+			)
+		}
+
+		if imageStoragePublicURL == "" {
+			return Config{}, fmt.Errorf(
+				"IMAGE_STORAGE_PUBLIC_URL is required when IMAGE_STORAGE_DRIVER=s3",
+			)
+		}
+	}
+
+	// Apply the local-storage default only after S3 validation.
+	if imageStoragePublicURL == "" {
+		imageStoragePublicURL = "/uploads/activities"
 	}
 
 	return Config{
@@ -104,6 +145,9 @@ func Load() (Config, error) {
 		RazorpayWebhookSecret: razorpayWebhookSecret,
 		ImageStorageDirectory: imageStorageDirectory,
 		ImageStoragePublicURL: imageStoragePublicURL,
+		ImageStorageDriver:    imageStorageDriver,
+		S3Bucket:              s3Bucket,
+		AWSRegion:             awsRegion,
 		TrustedProxies:        trustedProxies,
 	}, nil
 }
